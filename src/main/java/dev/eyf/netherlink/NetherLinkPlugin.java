@@ -173,15 +173,25 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * 玩家获得成就 → 上报给 AstrBot，由那边组装提示词交给 AI 处理好感与回复。
      *
      * 只上报「有展示信息的」成就：配方解锁（minecraft:recipes/*）与根成就
-     * （display 为 null）也会触发本事件，但那些不是玩家眼里的"获得成就"，
+     * 也会触发本事件，但那些不是玩家眼里的"获得成就"，
      * 报上去会让 AI 频繁无意义地加好感。
+     *
+     * ⚠️ 根成就的判据是「**有没有父成就**」，**不是**「display 是否为 null」。
+     * 实测（2026-09-28，NeoForge 端跑真服验证）：`minecraft:story/root`
+     * **是有 display 的**——那正是成就页签的图标与标题。所以 `display == null`
+     * 根本过滤不掉它，NeoForge 端实测收到了 `key='minecraft:story/root'`。
+     * Paper 的 {@code getDisplay()} 与 Fabric 的 {@code value().display()} 是同一个值。
      */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onAdvancement(PlayerAdvancementDoneEvent event) {
         var advancement = event.getAdvancement();
+        // 根成就：没有父成就（是某个分类的页签标题）
+        if (advancement.getParent() == null) {
+            return;
+        }
         var display = advancement.getDisplay();
         if (display == null) {
-            return;  // 根成就：没有展示名，不是玩家感知的成就
+            return;  // 没有展示信息，玩家看不到，不该上报
         }
         String key = advancement.getKey().getKey();   // 如 "story/mine_diamond"
         if (key.startsWith("recipes/")) {
