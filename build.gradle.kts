@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.eyf"
-version = "0.1.0"
+version = "0.1.1"
 
 java {
     // Paper 26.3 API 要求 JVM 25；toolchain 由 settings.gradle.kts 的 foojay 自动供给

@@ -4,7 +4,8 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 
 **必须先装好 AstrBot 侧插件**，本插件才能工作（它是客户端，主动连入 AstrBot）。
 
-> 📌 另有 [Fabric 版](https://github.com/MoeDawn/netherlink-fabric)。
+> 📌 另有 [Fabric 版](https://github.com/MoeDawn/netherlink-fabric) 与
+> [NeoForge 版](https://github.com/MoeDawn/netherlink-neoforge)。
 > 两个版本**协议完全相同**，接同一个 AstrBot 插件，服务端不用改配置。
 
 ---
@@ -32,7 +33,7 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 | **Purpur** | ✅ 可运行 | Paper 的分支，API 与事件完全一致 |
 | **Folia** | ⚠️ 已适配，未实机验证 | 已改用 Paper / Folia 共用的调度器，并声明 `folia-supported`。⚠️ 但没有在真 Folia 上跑过 |
 | Spigot | ❌ 不支持 | 缺少 Paper 专有的扩展接口（用于捕获指令输出） |
-| NeoForge | ❌ 不支持 | 尚未移植 |
+| NeoForge | — | 见 [NeoForge 版](https://github.com/MoeDawn/netherlink-neoforge) |
 | Fabric | — | 见 [Fabric 版](https://github.com/MoeDawn/netherlink-fabric) |
 
 > ⚠️ 只支持 **Minecraft 26.3**，其他 MC 版本暂未适配。
@@ -42,7 +43,7 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 ## 安装
 
 1. **下载 Release**
-   从 [Releases](https://github.com/MoeDawn/netherlink-plugin/releases) 下载 `netherlink-plugin-0.1.0.jar`
+   从 [Releases](https://github.com/MoeDawn/netherlink-plugin/releases) 下载 `netherlink-plugin-0.1.1.jar`
 
 2. **放入服务端**
    把 jar 放进服务器的 `plugins/` 目录，重启服务器
@@ -108,7 +109,7 @@ cd netherlink-plugin
 ./build.cmd          # Windows
 ```
 
-产物：`build/libs/netherlink-plugin-0.1.0.jar`
+产物：`build/libs/netherlink-plugin-0.1.1.jar`
 
 ---
 

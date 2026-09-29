@@ -2,9 +2,9 @@
 
 > 本文件用于 GitHub Release 的说明。格式参考 AstrBot 侧插件的 `CHANGELOG.md`。
 
-## 未发布
+## v0.1.1
 
-> 下面这项**已修复但尚未发版**——等确定版本号时把本小节标题改成正式版本号即可。
+NetherLink 的 MC 端 **Paper / Purpur / Folia** 插件——配套 AstrBot 上的 NetherLink 插件使用。
 
 ### 修复
 
@@ -49,7 +49,9 @@
 
 - **Spigot**：缺少 Paper 专有的扩展接口（用于捕获指令输出），这不是调度器层面
   能解决的。
-- **NeoForge**：尚未移植。**Fabric** 有单独的实现。
+- **NeoForge**：见 [NeoForge 版](https://github.com/MoeDawn/netherlink-neoforge)。
+  **Fabric** 见 [Fabric 版](https://github.com/MoeDawn/netherlink-fabric)。
+  三者与本节插件**协议完全相同**，接同一个 AstrBot 插件，服务端不用改配置。
 
 ## v0.0.2
 
