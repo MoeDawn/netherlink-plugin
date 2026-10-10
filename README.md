@@ -21,6 +21,13 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 
 ---
 
+## 功能
+
+- 游戏内聊天 / 进服 / 退服 / 死亡 / 成就 → QQ 群
+- QQ 群消息 → 游戏公屏（支持 `§` 染色码）
+- 游戏内唤醒词与 AI 对话
+- **本地菜单**：公屏发 `菜单` / `menu` / `メニュー`，点按钮传送（不经 AI、不消耗好感）
+
 ## 环境要求
 
 - Minecraft 服务端：**Paper 26.3 / Purpur 26.3 / Folia**
@@ -73,11 +80,20 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 | `token` | 握手鉴权密钥，两侧必须一致 |
 | `server-name` | 本服务器的**身份**，握手时上报。AstrBot 侧用它区分各台服务器。它**不是**显示名 |
 | `wake-prefixes` | 游戏内唤醒词（逗号分隔），**须与 AstrBot 侧 `mc_wake_prefixes` 一致**否则唤不醒 AI |
+| `menu-enable` | 本地菜单总开关。关掉后触发词不生效，那条话照常作为聊天上报 |
+| `menu-triggers` | 菜单触发词（逗号分隔）。**整条消息**等于其中之一才触发（唤醒词是前缀匹配，两者不同）|
+| `menu-title` | 菜单抬头 |
+| `menu-item-teleport-player` / `menu-item-teleport-death` | 两个菜单项的名字 |
+| `menu-teleport-cooldown` | 传送冷却，秒，防连点。0 = 无冷却 |
+| `menu-poll-interval` | 计分板轮询间隔，毫秒。0 = 关闭（不需要菜单时）|
+| `menu-objective` | 菜单与确认按钮共用的计分板名。**须与 AstrBot 侧 `mc_menu_objective` 一致** |
 
 > 显示名不在这里控制——QQ 群前缀、`{server}` 占位符、AI 上下文里的服务器名
 > 统一由 AstrBot 侧的 `ws_ports` 决定，取冒号前那段（没配则显示 `MC`）。
 
-**键名与默认值与 Fabric 端的 `config/netherlink.json` 逐字对齐**——换端时配置可以直接照搬。
+**除菜单那几项外，键名与默认值与 Fabric 端的 `config/netherlink.json` 逐字对齐**——
+换端时前面几项可以照搬。⚠️ **本地菜单目前只有本端有**（Fabric / NeoForge 尚未移植），
+那几项搬过去不会生效。
 
 ---
 
@@ -99,6 +115,7 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 | 成就上报 | ✅ 已验证 |
 | QQ → 游戏广播（§ 染色码渲染） | ✅ 已验证 |
 | **游戏内机器人对话（唤醒词）** | ✅ 已验证（含**真人玩家**） |
+| **本地菜单（公屏发触发词 → 点击传送）** | ⚠️ 已实现，**未真人验证**（点击无法自动化）|
 | **Folia 核心** | ✅ **已实机验证**（Folia 26.2） |
 | Purpur | ✅ 可运行（Paper 分支，API 与事件一致） |
 

@@ -42,3 +42,8 @@ tasks.shadowJar {
     archiveClassifier.set("")
     // 当前无第三方运行时依赖，shade 仅作保险；引入 Java-WebSocket 后自动打入
 }
+
+tasks.withType<JavaCompile>().configureEach {
+    // 打印弃用警告的**具体位置**（默认只给一句「使用了已过时的 API」，没有行号）
+    options.compilerArgs.addAll(listOf("-Xlint:deprecation"))
+}
