@@ -48,9 +48,10 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     // 游戏内机器人唤醒词（与 AstrBot 侧配置一致，逗号分隔）
     private final java.util.List<String> wakePrefixes = new java.util.ArrayList<>();
 
-    // 菜单/确认按钮用的计分板 objective。玩家的点击只能跑 0 权限的
-    // `trigger <它> set <token>`（MC 的硬约束：click_event 里的指令以玩家身份
-    // 解析，只有 trigger 能过）。本插件监听它，把 token 上报 AstrBot。
+    // **确认卡**用的计分板 objective（本地菜单已改走点击回调，不用它）。
+    // 确认卡由 AstrBot 下发 tellraw，里面只能跑 0 权限的
+    // `trigger <它> set <token>`（click_event 里的指令以玩家身份解析，
+    // 只有 trigger 能过）。本插件轮询它、把 token 上报 AstrBot。
     //
     // ⚠️ **只服务 AstrBot 的确认卡**（要回传一个整数 token，塞不进点击回调）。
     //    本地菜单**不用**它 —— 见下方菜单一节。
@@ -153,6 +154,13 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 // ⚠️ **先归零再上报**：不这么做，WS 断线时这个值会留存，
                 //    等重连后又被当成一次「新的点击」重复上报（陈旧点击）。
                 score.setScore(0);
+                // 🔴 **用完必须重新解锁**：`/trigger` 每成功一次就把该分数
+                //    `lock()` 掉（反编译 `TriggerCommand.getScore()` 证实）。
+                //    只靠进服/启用时那一次 `enable` 的话，**第二张确认卡就点不动**，
+                //    症状就是「你尚无法触发这个记分项」（2026-10-11 真机暴露）。
+                //    ⚠️ 顺序要紧：先 setScore(0) 再 unlock —— `unlock()` 只改锁，
+                //    不会把刚清掉的值带回来。
+                score.setTriggerable(true);
                 if (v < CONFIRM_TOKEN_BASE) {
                     continue;   // 旧版菜单码残留，不归本端管
                 }
@@ -202,8 +210,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * 后者会经我们的 command 通道产生一条 `command_result` 回执，
      * 那条回执的去向无从预料（多余的噪声）。
      *
-     * ⚠️ **`/trigger` 用过之后不会自动失效**（实测 + 源码：`TriggerCommand`
-     *    从不调 `setLocked`），所以一次解锁长期有效，不必每次重新解锁。
+     * 🔴 **`/trigger` 用过之后会自锁**（反编译 `TriggerCommand.getScore()`：
+     *    成功路径末尾调 `ScoreAccess.lock()`）。所以「一次 enable 长期有效」
+     *    是**错的** —— 每次消费掉点击后都要在 `pollMenu` 里重新解锁。
      */
     private void enableMenuTrigger(Player player) {
         try {
