@@ -52,13 +52,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     // `trigger <它> set <token>`（MC 的硬约束：click_event 里的指令以玩家身份
     // 解析，只有 trigger 能过）。本插件监听它，把 token 上报 AstrBot。
     //
-    // ⚠️ **不用轮询**：Paper 有 `PlayerCommandPreprocessEvent`，玩家敲的
-    // `trigger` 会先经过它 —— 比定时扫描精确、也没有空转开销。
+    // ⚠️ **只服务 AstrBot 的确认卡**（要回传一个整数 token，塞不进点击回调）。
+    //    本地菜单**不用**它 —— 见下方菜单一节。
     private String menuObjective = "netherlink_menu";
-
-    // 菜单轮询间隔（毫秒）。0 = 关闭轮询。
-    // 为什么可关：不需要菜单功能的部署可以彻底不跑这个定时任务。
-    private long menuPollIntervalMs = 1000L;
 
     // ---- 本地菜单（不经 AstrBot，全在 MC 端完成）----
     // 菜单总开关。关掉后触发词不生效，那条话照常作为聊天上报。
@@ -75,18 +71,19 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     // 传送冷却（秒），防连点。0 = 无冷却。
     private long menuTeleportCooldownSec = 3L;
 
-    // 玩家 UUID -> 上次传送的毫秒时间戳。只在主线程访问（pollMenu 走
+    // 玩家 UUID -> 上次传送的毫秒时间戳。只在主线程访问（点击回调里切了
     // global region scheduler），所以不需要并发容器。
     private final java.util.Map<java.util.UUID, Long> menuLastTeleport =
             new java.util.HashMap<>();
 
-    // 菜单码（trigger 计分板的分值）。**必须与 AstrBot 的确认卡 token 空间
-    // 分开**：确认卡 token 从 10000 起，这里的码全部 < 10000。
-    private static final int MENU_CODE_IDLE = 0;
-    private static final int MENU_CODE_MAIN = 1;
-    private static final int MENU_CODE_DEATH = 10;
-    private static final int MENU_CODE_PLAYER_BASE = 1000;
-    // 达到这个值就是 AstrBot 的确认卡 token，不归菜单管。
+    // 确认卡轮询间隔（毫秒）。0 = 关闭轮询（关掉则确认卡点了没反应）。
+    // ⚠️ 只有**确认卡**走这条路；本地菜单走点击回调，不用轮询。
+    private long menuPollIntervalMs = 1000L;
+
+    // AstrBot 确认卡 token 的起点。计分板里小于它的值一律**不归本端处理**
+    // （本地菜单已经不用计分板了，见下方菜单一节）。
+    // ⚠️ **必须与 AstrBot 的 `actions.TOKEN_BASE` 相等** —— 守卫
+    //    `test_menu_code_space_does_not_collide_with_confirm_tokens` 钉着。
     private static final int CONFIRM_TOKEN_BASE = 10000;
 
     @Override
@@ -102,15 +99,29 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         wsClient.connect();
 
         Bukkit.getPluginManager().registerEvents(this, this);
+        // ⚠️ 下面这组**只服务 AstrBot 的确认卡**（要回传一个整数 token，
+        //    塞不进点击回调）。本地菜单走点击回调，不需要它们 —— 见下方菜单一节。
         ensureMenuObjective();
+        // 解锁**当前已在线**的玩家：只在 onJoin 做的话，重载插件时已经在线的
+        // 人拿不到 trigger 权限（实测症状：点确认报「你尚无法触发这个记分项」）。
+        for (Player online : Bukkit.getOnlinePlayers()) {
+            enableMenuTrigger(online);
+        }
         startMenuPolling();
         getLogger().info("NetherLink MC 端已启用，目标 AstrBot: " + host + ":" + port);
     }
 
-    /** 启动菜单轮询（每秒读一次计分板）。`menu-poll-interval: 0` 可关掉。 */
+    /**
+     * 启动确认卡轮询（每秒读一次计分板）。`menu-poll-interval: 0` 可关掉。
+     *
+     * 🔴 **为什么确认卡不用点击回调**：回调的载荷是 SNBT，要塞进 tellraw 的
+     *    JSON 文本里，而确认卡是 **AstrBot 用 Python 拼的 JSON 字符串**下发的
+     *    —— 让它去生成 `custom` 点击的 SNBT 载荷得不偿失。计分板只需要一个
+     *    整数，是这里最省事也最稳的回传通道。
+     */
     private void startMenuPolling() {
         if (menuPollIntervalMs <= 0) {
-            getLogger().info("NetherLink: 菜单轮询已关闭（menu-poll-interval=0）");
+            getLogger().info("NetherLink: 确认卡轮询已关闭（menu-poll-interval=0）");
             return;
         }
         // ⚠️ 读计分板必须回主线程；`runAtFixedRate` 的回调在异步线程。
@@ -120,7 +131,47 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     }
 
     /**
-     * 保证菜单那个 trigger 型 objective 存在。
+     * 读计分板，把**确认卡**的点击上报 AstrBot。
+     *
+     * ⚠️ 小于 `CONFIRM_TOKEN_BASE` 的值一律**忽略**：那本该是旧版本地菜单的码，
+     *    现在菜单不走计分板了，但旧 jar 可能还在写 —— 上报上去只会让 AstrBot
+     *    收到它没发过的 token。
+     */
+    private void pollMenu() {
+        try {
+            var board = Bukkit.getScoreboardManager().getMainScoreboard();
+            var obj = board.getObjective(menuObjective);
+            if (obj == null) {
+                return;
+            }
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                var score = obj.getScore(p.getName());
+                int v = score.getScore();
+                if (v <= 0) {
+                    continue;   // 0 = 空闲/取消
+                }
+                // ⚠️ **先归零再上报**：不这么做，WS 断线时这个值会留存，
+                //    等重连后又被当成一次「新的点击」重复上报（陈旧点击）。
+                score.setScore(0);
+                if (v < CONFIRM_TOKEN_BASE) {
+                    continue;   // 旧版菜单码残留，不归本端管
+                }
+                JsonObject o = new JsonObject();
+                o.addProperty("type", "action_confirm");
+                o.addProperty("player", p.getName());
+                o.addProperty("token", v);
+                report(o);
+                getLogger().info("NetherLink: 收到确认点击 player=" + p.getName()
+                        + " token=" + v);
+            }
+        } catch (Exception e) {
+            // 轮询出问题**不能**刷屏：它每秒都跑。只在异常时记一条。
+            getLogger().warning("NetherLink: 确认卡轮询失败（忽略本次）: " + e);
+        }
+    }
+
+    /**
+     * 保证菜单那个 trigger 型 objective 存在（**只服务 AstrBot 的确认卡**）。
      *
      * ⚠️ **幂等**：重复建同名 objective 在原版指令里会报
      * `An objective already exists by that name`（实测），所以先查再建。
@@ -181,7 +232,6 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         serverName = getConfig().getString("server-name", "mc");
         // ⚠️ 必须与 AstrBot 侧的 mc_menu_objective 一致（确认按钮靠它回传 token）
         menuObjective = getConfig().getString("menu-objective", "netherlink_menu");
-        menuPollIntervalMs = getConfig().getLong("menu-poll-interval", 1000L);
         menuEnable = getConfig().getBoolean("menu-enable", true);
         menuTitle = getConfig().getString("menu-title", "\u2726 \u83dc\u5355 \u2726");
         menuItemTeleportPlayer = getConfig().getString(
@@ -189,6 +239,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         menuItemTeleportDeath = getConfig().getString(
                 "menu-item-teleport-death", "\u4f20\u9001\u6b7b\u4ea1\u70b9");
         menuTeleportCooldownSec = getConfig().getLong("menu-teleport-cooldown", 3L);
+        menuPollIntervalMs = getConfig().getLong("menu-poll-interval", 1000L);
         menuTriggers.clear();
         for (String m : getConfig().getString("menu-triggers", "\u83dc\u5355,menu,\u30e1\u30cb\u30e5\u30fc").split(",")) {
             if (!m.isBlank()) {
@@ -226,8 +277,6 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         # 菜单/确认按钮用的计分板 objective
                         # 必须与 AstrBot 侧 mc_menu_objective 一致
                         menu-objective: "netherlink_menu"
-                        # 菜单轮询间隔（毫秒）。0 = 关闭（不需要菜单时）
-                        menu-poll-interval: 1000
                         # ---- 本地菜单（不经 AstrBot，全在 MC 端完成）----
                         # 总开关。关掉后触发词不生效，那条话照常作为聊天上报
                         menu-enable: true
@@ -240,6 +289,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         menu-item-teleport-death: "\u4f20\u9001\u6b7b\u4ea1\u70b9"
                         # 传送冷却（秒），防连点。0 = 无冷却
                         menu-teleport-cooldown: 3
+                        # 确认卡轮询间隔（毫秒）。0 = 关闭（关掉则确认卡点了没反应）
+                        # ⚠️ 只服务来自 AstrBot 的确认卡；本地菜单用点击回调
+                        menu-poll-interval: 1000
                         """);
             } catch (Exception e) {
                 getLogger().warning("写入默认配置失败: " + e.getMessage());
@@ -302,66 +354,25 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         report(o);
     }
 
-    /**
-     * 玩家点了菜单/确认按钮 → 上报 AstrBot。
-     *
-     * 🔴 **为什么是轮询而不是事件钩子**（三端一致性的取舍，2026-10-10 定）：
-     *   · Paper 有 `PlayerCommandPreprocessEvent`，但它标了 **`forRemoval=true`**
-     *     —— 用一个将被移除的 API 是给自己埋雷
-     *   · **Fabric 压根没有**「有人执行了命令」的事件（`fabric-command-api-v2`
-     *     只有 `CommandRegistrationCallback`，那是**注册**回调）
-     *   · ⇒ 任何「挂钩玩家指令」的路子都会让三端实现分叉
-     * 所以三端统一走**原版语义**：读计分板。只用原版 API，不依赖第三方，
-     * 三端逻辑一模一样（各自的定时器 API 本来就不同，心跳早已如此）。
-     *
-     * 代价是**最多约 1 秒延迟**（可配 `menu-poll-interval`）—— 点个确认按钮
-     * 等 1 秒可以接受，换来的是三端一致且不欠技术债。
-     */
-    private void pollMenu() {
-        try {
-            var board = Bukkit.getScoreboardManager().getMainScoreboard();
-            var obj = board.getObjective(menuObjective);
-            if (obj == null) {
-                return;
-            }
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                var score = obj.getScore(p.getName());
-                int v = score.getScore();
-                if (v <= 0) {
-                    continue;   // 0 = 空闲/取消，没什么可做的
-                }
-                // ⚠️ **先归零再上报**：不这么做，WS 断线时这个值会留存，
-                //    等重连后又被当成一次「新的点击」重复上报（陈旧点击）。
-                score.setScore(0);
-
-                // 菜单码与确认卡 token 共用一个 objective，靠**数值区间**分流：
-                // 菜单码都是 < 10000 的小整数（1 / 10 / 1000+i），AstrBot 的
-                // 确认卡 token 从 10000 起。菜单在本地就能做完，不上报。
-                if (v < CONFIRM_TOKEN_BASE) {
-                    handleMenuCode(p, v);
-                    continue;
-                }
-
-                JsonObject o = new JsonObject();
-                o.addProperty("type", "action_confirm");
-                o.addProperty("player", p.getName());
-                o.addProperty("token", v);
-                report(o);
-                getLogger().info("NetherLink: 收到确认点击 player=" + p.getName()
-                        + " token=" + v);
-            }
-        } catch (Exception e) {
-            // 轮询出问题**不能**刷屏：它每秒都跑。只在异常时记一条。
-            getLogger().warning("NetherLink: 菜单轮询失败（忽略本次）: " + e);
-        }
-    }
-
-
     // ------------------------------------------------------------------
     // 本地菜单（全部在 MC 端完成，不经 AstrBot、不消耗好感）
+    //
+    // 🔴 **用 Paper 的点击回调（`ClickEvent.callback`），不用 `/trigger` 计分板**。
+    //    计分板那条路有两个死穴（2026-10-11 实机暴露，玩家截图里全看得见）：
+    //      · `/trigger` 会回显**自己的**成功/失败消息，玩家看得见且无法抑制
+    //        （`commands.trigger.set.success` = 「已触发[...]（数值已设为 N）」、
+    //         `commands.trigger.failed.unprimed` = 「你尚无法触发这个记分项」）
+    //      · `/trigger` 的硬前提是「该分数已被 `players enable` 解锁」，
+    //        而解锁只在 `onJoin` 做 ⇒ **更新插件时已经在线的玩家不会被解锁**
+    //    回调则由客户端直接回传一个自定义点击包（Paper 26.3 已实现：
+    //    `ServerboundCustomClickActionPacket` + `ClickCallbackProviderImpl`），
+    //    **无指令、无计分板、无回显、无需解锁**。
+    //
+    //    ⚠️ 来自 AstrBot 的**确认卡仍然走计分板** —— 那要回传一个整数 token，
+    //       塞不进点击回调。两条路互不相干，`menuObjective` 现在只服务确认卡。
     // ------------------------------------------------------------------
 
-    /** 在线的其他玩家（按名字排序）。索引稳定 = 菜单里的第 i 项。 */
+    /** 在线的其他玩家（按名字排序）。 */
     private java.util.List<Player> menuTargets(Player viewer) {
         java.util.List<Player> list = new java.util.ArrayList<>();
         for (Player p : Bukkit.getOnlinePlayers()) {
@@ -373,46 +384,64 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         return list;
     }
 
-    /** 一个可点击的菜单项：私聊发出去，点了跑 `trigger <obj> set <code>`。 */
+    /**
+     * 一个可点击的菜单项。点了在主线程执行 `action`。
+     *
+     * ⚠️ **`hover` 两个主菜单项也必须给** —— 2026-10-11 实机暴露：只给玩家列表
+     * 的按钮加了悬浮说明，主菜单那两项没加，玩家悬浮上去什么都没有。
+     */
     private net.kyori.adventure.text.Component menuButton(
-            String label, net.kyori.adventure.text.format.TextColor color, int code) {
+            String label, net.kyori.adventure.text.format.TextColor color,
+            net.kyori.adventure.text.Component hover,
+            java.util.function.Consumer<Player> action) {
         return net.kyori.adventure.text.Component.text()
                 .append(net.kyori.adventure.text.Component.text("[ " + label + " ]")
                         .decorate(net.kyori.adventure.text.format.TextDecoration.BOLD))
                 .color(color)
-                .clickEvent(net.kyori.adventure.text.event.ClickEvent.runCommand(
-                        "trigger " + menuObjective + " set " + code))
+                .hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(hover))
+                .clickEvent(net.kyori.adventure.text.event.ClickEvent.callback(
+                        (net.kyori.adventure.audience.Audience audience) -> {
+                            if (!(audience instanceof Player clicker)) {
+                                return;
+                            }
+                            // 回调不保证在主线程（Paper 从网络包处理时调）⇒ 切回去
+                            Bukkit.getGlobalRegionScheduler().execute(
+                                    this, () -> action.accept(clicker));
+                        },
+                        opts -> opts
+                                .uses(net.kyori.adventure.text.event.ClickCallback.UNLIMITED_USES)
+                                .lifetime(java.time.Duration.ofHours(1))))
                 .build();
     }
 
-    /** 分隔线。 */
+    /** 分隔线（16 个 ✦）。 */
     private net.kyori.adventure.text.Component menuRule() {
         return net.kyori.adventure.text.Component.text(
-                " \\u2726\\u2726\\u2726\\u2726\\u2726\\u2726\\u2726\\u2726"
-                        + "\\u2726\\u2726\\u2726\\u2726\\u2726\\u2726\\u2726",
+                " ✦✦✦✦✦✦✦✦"
+                        + "✦✦✦✦✦✦✦✦",
                 net.kyori.adventure.text.format.NamedTextColor.DARK_GRAY);
     }
 
-    /** 主菜单：私聊给玩家，两个按钮。 */
+    /** 主菜单：私聊给玩家，两个按钮（都带悬浮说明）。 */
     private void sendMainMenu(Player player) {
         try {
-            var line = net.kyori.adventure.text.Component.text()
+            player.sendMessage(net.kyori.adventure.text.Component.text()
                     .append(net.kyori.adventure.text.Component.text(menuTitle,
                             net.kyori.adventure.text.format.NamedTextColor.GOLD,
                             net.kyori.adventure.text.format.TextDecoration.BOLD))
                     .append(menuRule())
-                    .build();
-            player.sendMessage(line);
-
+                    .build());
             player.sendMessage(net.kyori.adventure.text.Component.text()
                     .append(net.kyori.adventure.text.Component.space())
                     .append(menuButton(menuItemTeleportPlayer,
                             net.kyori.adventure.text.format.NamedTextColor.AQUA,
-                            MENU_CODE_PLAYER_BASE))
+                            net.kyori.adventure.text.Component.text("列出在线玩家，点击传送"),
+                            this::sendPlayerMenu))
                     .append(net.kyori.adventure.text.Component.space())
                     .append(menuButton(menuItemTeleportDeath,
                             net.kyori.adventure.text.format.NamedTextColor.LIGHT_PURPLE,
-                            MENU_CODE_DEATH))
+                            net.kyori.adventure.text.Component.text("传送到上次死亡位置"),
+                            this::teleportToDeath))
                     .build());
         } catch (Exception e) {
             getLogger().warning("NetherLink: 发送菜单失败（" + player.getName() + "）: " + e);
@@ -435,51 +464,27 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         "  当前没有其他在线玩家。",
                         net.kyori.adventure.text.format.NamedTextColor.GRAY));
             }
-            for (int i = 0; i < targets.size(); i++) {
-                Player target = targets.get(i);
+            for (Player target : targets) {
+                // 🔴 **把目标名字捕获进闭包**，不编码序号 —— 序号会因玩家进出而
+                //    错位，名字才是身份。执行时按名字**重新查**（spec §7.5 裁决 2）。
+                final String name = target.getName();
                 player.sendMessage(net.kyori.adventure.text.Component.text()
                         .append(net.kyori.adventure.text.Component.space())
-                        .append(menuButton(target.getName(),
+                        .append(menuButton(name,
                                 net.kyori.adventure.text.format.NamedTextColor.GREEN,
-                                MENU_CODE_PLAYER_BASE + i)
-                                .hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(
-                                        net.kyori.adventure.text.Component.text(
-                                                "点击传送到 " + target.getName()))))
+                                net.kyori.adventure.text.Component.text("点击传送到 " + name),
+                                p -> teleportToPlayerByName(p, name)))
                         .build());
             }
             player.sendMessage(net.kyori.adventure.text.Component.text()
                     .append(net.kyori.adventure.text.Component.space())
-                    .append(menuButton("\\u8fd4\\u56de",
+                    .append(menuButton("返回",
                             net.kyori.adventure.text.format.NamedTextColor.GRAY,
-                            MENU_CODE_MAIN))
+                            net.kyori.adventure.text.Component.text("回到主菜单"),
+                            this::sendMainMenu))
                     .build());
         } catch (Exception e) {
             getLogger().warning("NetherLink: 发送玩家列表失败（" + player.getName() + "）: " + e);
-        }
-    }
-
-    /**
-     * 处理一个菜单码。**只在主线程调用**（pollMenu 已经切过来了）。
-     *
-     * 传送成功**公屏广播**（所有人都看得见谁传送到哪去了）；失败与「没有
-     * 死亡点记录」**只私聊**给本人。
-     */
-    private void handleMenuCode(Player player, int code) {
-        try {
-            if (code == MENU_CODE_MAIN) {
-                sendMainMenu(player);
-                return;
-            }
-            if (code == MENU_CODE_DEATH) {
-                teleportToDeath(player);
-                return;
-            }
-            if (code >= MENU_CODE_PLAYER_BASE) {
-                teleportToPlayer(player, code - MENU_CODE_PLAYER_BASE);
-            }
-        } catch (Exception e) {
-            getLogger().warning("NetherLink: 处理菜单码失败 player=" + player.getName()
-                    + " code=" + code + ": " + e);
         }
     }
 
@@ -497,22 +502,30 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         return true;
     }
 
-    private void teleportToPlayer(Player player, int index) {
+    /**
+     * 传送到某个玩家（按**名字**重新查；查不到就是已经下线）。
+     *
+     * ✅ 传送**成功公屏广播**（用户 2026-10-11 要求：让所有人都能看见谁传到哪去了）；
+     * 失败**只私聊**。
+     */
+    private void teleportToPlayerByName(Player player, String targetName) {
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target == null || !target.isOnline()) {
+            player.sendMessage(net.kyori.adventure.text.Component.text(
+                    targetName + " 已不在线。",
+                    net.kyori.adventure.text.format.NamedTextColor.RED));
+            sendPlayerMenu(player);   // 名单变了，顺手重开一份
+            return;
+        }
+        if (target.getUniqueId().equals(player.getUniqueId())) {
+            return;
+        }
         if (!menuCooldownOk(player)) {
             player.sendMessage(net.kyori.adventure.text.Component.text(
                     "传送太频繁，请稍候。",
                     net.kyori.adventure.text.format.NamedTextColor.RED));
             return;
         }
-        // 🔴 **名字复核**（spec §7.5 张力 2）：索引会因玩家进出而错位，
-        //    所以拿当前名单的第 index 项**重新核对**。对不上就什么都不做，
-        //    静默重开菜单 —— 绝不按错的索引把人传走。
-        java.util.List<Player> targets = menuTargets(player);
-        if (index < 0 || index >= targets.size()) {
-            sendPlayerMenu(player);
-            return;
-        }
-        Player target = targets.get(index);
         player.teleportAsync(target.getLocation(),
                 org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.PLUGIN);
         Bukkit.getServer().broadcast(net.kyori.adventure.text.Component.text()
@@ -525,28 +538,26 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 .build());
     }
 
+    /**
+     * 传送到上次死亡点。
+     *
+     * 坐标读 `Player.getLastDeathLocation()`（继承自 `HumanEntity`，`OfflinePlayer`
+     * 上也有）—— **不给死亡事件加坐标**，那会把玩家位置流进推群模板与 AI
+     * 上下文（claude.md 坑 11）。
+     */
     private void teleportToDeath(Player player) {
-        // 坐标来自原版实体上的 LastDeathLocation（`Player.getLastDeathLocation()`
-        // 继承自 HumanEntity）—— **不给死亡事件加坐标**，那样会把玩家位置
-        // 流进推群模板与 AI 上下文（见 claude.md 坑 11）。
         org.bukkit.Location loc = player.getLastDeathLocation();
-        // ✅ 「没有死亡点记录」只私聊 —— 这是私事。
+        // ✅ 「没有死亡点记录」只私聊 —— 这是私事
         if (loc == null) {
             player.sendMessage(net.kyori.adventure.text.Component.text(
                     "没有死亡点记录。",
                     net.kyori.adventure.text.format.NamedTextColor.RED));
             return;
         }
-        // ⚠️ Location 的 world 可能为 null（那份维度没被加载）—— 用**名字**
+        // ⚠️ Location 的 world 可能为 null（那份维度没被加载）—— 用**世界名**
         //    重新解析，别指望直接 teleport 一个 world 为 null 的位置。
         org.bukkit.World world = loc.getWorld();
-        if (world == null || world.getName().isEmpty()) {
-            player.sendMessage(net.kyori.adventure.text.Component.text(
-                    "死亡点所在世界已不可用。",
-                    net.kyori.adventure.text.format.NamedTextColor.RED));
-            return;
-        }
-        org.bukkit.World resolved = Bukkit.getWorld(world.getName());
+        org.bukkit.World resolved = world == null ? null : Bukkit.getWorld(world.getName());
         if (resolved == null) {
             player.sendMessage(net.kyori.adventure.text.Component.text(
                     "死亡点所在世界已不可用。",

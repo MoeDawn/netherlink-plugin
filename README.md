@@ -85,8 +85,7 @@ Minecraft 服务端插件（Paper / Purpur / Folia），与 [AstrBot 侧的 Neth
 | `menu-title` | 菜单抬头 |
 | `menu-item-teleport-player` / `menu-item-teleport-death` | 两个菜单项的名字 |
 | `menu-teleport-cooldown` | 传送冷却，秒，防连点。0 = 无冷却 |
-| `menu-poll-interval` | 计分板轮询间隔，毫秒。0 = 关闭（不需要菜单时）|
-| `menu-objective` | 菜单与确认按钮共用的计分板名。**须与 AstrBot 侧 `mc_menu_objective` 一致** |
+| `menu-objective` | AstrBot 确认卡用的计分板名。**须与 AstrBot 侧 `mc_menu_objective` 一致** |
 
 > 显示名不在这里控制——QQ 群前缀、`{server}` 占位符、AI 上下文里的服务器名
 > 统一由 AstrBot 侧的 `ws_ports` 决定，取冒号前那段（没配则显示 `MC`）。
