@@ -68,6 +68,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     private String menuTitle = "\u2726 \u83dc\u5355 \u2726";
     private String menuItemTeleportPlayer = "\u4f20\u9001\u5230\u73a9\u5bb6";
     private String menuItemTeleportDeath = "\u4f20\u9001\u6b7b\u4ea1\u70b9";
+    private String menuItemShowItem = "\u5c55\u793a\u624b\u4e0a\u7684\u7269\u54c1";
 
     // 传送冷却（秒），防连点。0 = 无冷却。
     private long menuTeleportCooldownSec = 3L;
@@ -247,6 +248,8 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 "menu-item-teleport-player", "\u4f20\u9001\u5230\u73a9\u5bb6");
         menuItemTeleportDeath = getConfig().getString(
                 "menu-item-teleport-death", "\u4f20\u9001\u6b7b\u4ea1\u70b9");
+        menuItemShowItem = getConfig().getString(
+                "menu-item-show-item", "\u5c55\u793a\u624b\u4e0a\u7684\u7269\u54c1");
         menuTeleportCooldownSec = getConfig().getLong("menu-teleport-cooldown", 3L);
         menuPollIntervalMs = getConfig().getLong("menu-poll-interval", 1000L);
         menuTriggers.clear();
@@ -296,6 +299,8 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         menu-title: "\u2726 \u83dc\u5355 \u2726"
                         menu-item-teleport-player: "\u4f20\u9001\u5230\u73a9\u5bb6"
                         menu-item-teleport-death: "\u4f20\u9001\u6b7b\u4ea1\u70b9"
+                        # 第三项:把手上的物品展示给全服(带悬停详情)
+                        menu-item-show-item: "\u5c55\u793a\u624b\u4e0a\u7684\u7269\u54c1"
                         # 传送冷却（秒），防连点。0 = 无冷却
                         menu-teleport-cooldown: 3
                         # 确认卡轮询间隔（毫秒）。0 = 关闭（关掉则确认卡点了没反应）
@@ -464,6 +469,15 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                             net.kyori.adventure.text.Component.text("传送到上次死亡位置"),
                             this::teleportToDeath))
                     .build());
+            // 第三项单独一行 —— 三个按钮挤一行会超宽
+            player.sendMessage(net.kyori.adventure.text.Component.text()
+                    .append(net.kyori.adventure.text.Component.space())
+                    .append(menuButton(menuItemShowItem,
+                            net.kyori.adventure.text.format.NamedTextColor.YELLOW,
+                            net.kyori.adventure.text.Component.text(
+                                    "把手上那件物品展示给全服"),
+                            this::showHeldItem))
+                    .build());
         } catch (Exception e) {
             getLogger().warning("NetherLink: 发送菜单失败（" + player.getName() + "）: " + e);
         }
@@ -513,6 +527,52 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         } catch (Exception e) {
             getLogger().warning("NetherLink: 发送玩家列表失败（" + player.getName() + "）: " + e);
         }
+    }
+
+    /**
+     * 展示手上的物品给**全服**（用户 2026-10-11 要求）。
+     *
+     * 可见文本 `⌜玩家名⌟ 展示了一件物品  ⌜物品名⌝ ×N`，物品名**蓝字 +
+     * show_item 悬停** —— 悬停所见与玩家在物品栏里一致
+     * （`ItemStack.asHoverEvent()` 带完整组件）。
+     *
+     * ⚠️ **不走 report()**：与传送那两项一样完全不依赖 AstrBot（离线可用、不消耗好感）。
+     */
+    private void showHeldItem(Player player) {
+        org.bukkit.inventory.ItemStack held = player.getInventory().getItemInMainHand();
+        if (held == null || held.getType().isAir()) {
+            player.sendMessage(net.kyori.adventure.text.Component.text(
+                    "你手上没有东西。",
+                    net.kyori.adventure.text.format.NamedTextColor.GRAY));
+            return;
+        }
+        String name = held.hasData(io.papermc.paper.datacomponent.DataComponentTypes.CUSTOM_NAME)
+                ? PLAIN.serialize(held.getData(
+                        io.papermc.paper.datacomponent.DataComponentTypes.CUSTOM_NAME))
+                : "";
+        if (name.isEmpty()) {
+            name = held.getType().getKey().getKey();
+        }
+        // show_item.count 上限 99，超了**整条消息发不出去** ⇒ 夹到 99
+        final int n = Math.max(1, Math.min(held.getAmount(), 99));
+        final net.kyori.adventure.text.Component head =
+                net.kyori.adventure.text.Component.text()
+                        .append(net.kyori.adventure.text.Component.text(
+                                "⌜" + player.getName() + "⌟ ",
+                                net.kyori.adventure.text.format.NamedTextColor.GOLD))
+                        .append(net.kyori.adventure.text.Component.text(
+                                "展示了一件物品  ",
+                                net.kyori.adventure.text.format.NamedTextColor.WHITE))
+                        .build();
+        // ⚠️ 这里**不能** `.build()` —— `Component.text()` 返回 `TextComponent`,
+        //    它没有 build()（本会话踩过；链式调用直接就是组件）
+        final net.kyori.adventure.text.Component body =
+                net.kyori.adventure.text.Component.text(
+                                "⌜" + name + "⌝ ×" + n,
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA)
+                        .hoverEvent(held.asHoverEvent());
+        Bukkit.getGlobalRegionScheduler().execute(this, () ->
+                getServer().broadcast(head.append(body)));
     }
 
     /** 冷却检查。返回 true 表示这次点击可以执行。 */
@@ -698,6 +758,14 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      */
     private void handleLineDown(JsonObject data) {
         String line = data.has("line") ? data.get("line").getAsString() : "";
+        // 🔴 `parts` 是**结构化**的那份（可选）：`[{type:text,text}, {type:items,items}]`。
+        //    有它就按它建组件 —— 那样提到的物品能**染色 + 带 show_item 悬停**
+        //    （用户 2026-07-11 要求）；没有就照旧吃 legacy 文本（向后兼容，
+        //    推群那条模板、以及别的 `bot_reply` 发送方都不带 parts）。
+        if (data.has("parts")) {
+            renderParts(data.getAsJsonArray("parts"));
+            return;
+        }
         if (line.isEmpty()) {
             return;
         }
@@ -705,6 +773,61 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         // getServer().broadcast(...) 是 Server 接口上的 default 方法，Folia 可用
         // （Bukkit.broadcast 这个静态门面则不一定）。
         Bukkit.getGlobalRegionScheduler().execute(this, () -> getServer().broadcast(rendered));
+    }
+
+    /**
+     * 把 AstrBot 下发的**结构化部件**渲染成一个组件并广播。
+     *
+     * · `text`  部件：走 legacy 反序列化（能带 `§` 色码）
+     * · `items` 部件：每个物品染成**蓝色**，并挂 `show_item` 悬停 ——
+     *   悬停所见与物品栏里一致（组件一并带上，与确认卡同一口径）
+     *   ⚠️ `show_item.count` 上限 99，超了**整条消息发不出去** ⇒ 夹到 99
+     */
+    private void renderParts(com.google.gson.JsonArray parts) {
+        net.kyori.adventure.text.Component out = net.kyori.adventure.text.Component.empty();
+        for (com.google.gson.JsonElement pe : parts) {
+            if (!pe.isJsonObject()) {
+                continue;
+            }
+            JsonObject p = pe.getAsJsonObject();
+            String type = p.has("type") ? p.get("type").getAsString() : "text";
+            if ("items".equals(type) && p.has("items")) {
+                for (com.google.gson.JsonElement ie : p.getAsJsonArray("items")) {
+                    JsonObject it = ie.getAsJsonObject();
+                    String id = it.get("id").getAsString();
+                    int n = it.has("count") ? it.get("count").getAsInt() : 1;
+                    String name = it.has("name") && !it.get("name").getAsString().isEmpty()
+                            ? it.get("name").getAsString() : id;
+                    String comps = it.has("components") && !it.get("components").isJsonNull()
+                            ? it.get("components").getAsString() : "";
+                    org.bukkit.inventory.ItemStack show = null;
+                    if (!comps.isEmpty()) {
+                        show = buildItem(id.contains(":") ? id : "minecraft:" + id, 1, comps);
+                    }
+                    if (show == null) {
+                        show = buildItem(id.contains(":") ? id : "minecraft:" + id,
+                                Math.max(1, Math.min(n, 99)), "");
+                    }
+                    if (show == null) {
+                        // 连裸物品都造不出来（id 写错了）—— 退回纯文本，别整条丢掉
+                        out = out.append(net.kyori.adventure.text.Component.text(
+                                "⌜" + name + "⌝ ×" + n,
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA));
+                        continue;
+                    }
+                    show.setAmount(Math.max(1, Math.min(n, 99)));
+                    out = out.append(net.kyori.adventure.text.Component.text(
+                                    "⌜" + name + "⌝ ×" + n,
+                                    net.kyori.adventure.text.format.NamedTextColor.AQUA)
+                            .hoverEvent(show.asHoverEvent()));
+                }
+            } else if (p.has("text")) {
+                out = out.append(LEGACY.deserialize(p.get("text").getAsString()));
+            }
+        }
+        final net.kyori.adventure.text.Component rendered = out;
+        Bukkit.getGlobalRegionScheduler().execute(
+                this, () -> getServer().broadcast(rendered));
     }
 
     private void handleCommandDown(JsonObject data) {
@@ -757,8 +880,19 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     //    加新动作不用改这里。
     // ------------------------------------------------------------------
 
-    /** 一次待确认的卡片：token → steps（取消时用不着，但留着便于排查）。 */
-    private final java.util.Map<Integer, String> pendingActions = new java.util.HashMap<>();
+    /**
+     * 一次待确认的卡片：token → steps（取消时用不着，但留着便于排查）。
+     *
+     * 🔴 **必须并发安全**： 在 WS 异步线程（ 由
+     *     调，而它跑在  里），
+     *     在**主线程**（点击回调 / ）。
+     *    2026-10-11 评审发现这里是普通  ⇒ 并发改结构，
+     *    症状是**玩家点了确认什么都没发生、也不报错**（条目丢了）。
+     *    ⚠️ 同项目的  一直是 ，
+     *    这里是漏网的那一个。
+     */
+    private final java.util.Map<Integer, String> pendingActions =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     private void handleActionOffer(JsonObject data) {
         final int token = data.has("token") ? data.get("token").getAsInt() : 0;
@@ -1094,6 +1228,16 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     /** 执行一个非 check 的步骤。返回 null = 成功，否则是给玩家看的失败原因。 */
     private String applyStep(Player player, JsonObject st) {
         String op = st.get("op").getAsString();
+        // ---- command：动作自带的整条命令（模板已在 AstrBot 侧渲染好）----
+        // ⚠️ 必须排在下面 `st.get("item")` **之前** —— command 步没有 `item` 键，
+        //    先读它会 NoSuchElementException。
+        if ("command".equals(op)) {
+            String cmd = st.has("cmd") ? st.get("cmd").getAsString() : "";
+            if (cmd.isEmpty()) {
+                return "命令是空的（动作模板没渲染出东西）";
+            }
+            return runConsoleCommand(cmd);
+        }
         // modify 走槽位、不叫 item
         if ("modify".equals(op)) {
             return applyModify(player, st);
@@ -1111,6 +1255,34 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             return giveItems(player, id, n, comps);
         }
         return "未知的步骤类型：" + op;
+    }
+
+    /**
+     * 以控制台身份跑一条命令。返回 null = 成功，否则是给玩家看的失败原因。
+     *
+     * ⚠️ 与 `handleCommandDown` **同一口径**：必须用 `Bukkit.createCommandSender`
+     *    造发送器，不能自造 Proxy（`VanillaCommandWrapper` 只认 6 种具体类型）。
+     *    复用它返回的 `FeedbackForwardingSender`：权限等同控制台。
+     *
+     * 🔴 `command` 步**无法预校验**（命令成不成只有跑了才知道）⇒
+     *    `parse_actions` 规定含 command 的动作**只能有这一步**，
+     *    否则「前面扣了材料、这一步失败」会留下半成品。
+     */
+    private String runConsoleCommand(String cmd) {
+        try {
+            StringBuilder output = new StringBuilder();
+            CommandSender console = Bukkit.createCommandSender(
+                    (net.kyori.adventure.text.Component component) ->
+                            output.append(PLAIN.serialize(component)).append('\n'));
+            boolean ok = Bukkit.dispatchCommand(console, cmd);
+            if (ok) {
+                return null;
+            }
+            String out = output.toString().trim();
+            return "命令执行失败：" + cmd + (out.isEmpty() ? "" : "（" + out + "）");
+        } catch (Exception e) {
+            return "命令执行出错：" + cmd + "（" + e.getMessage() + "）";
+        }
     }
 
     /** 把 `id[组件]` 造成 ItemStack。造不出来返回 null（**不抛**）。 */
