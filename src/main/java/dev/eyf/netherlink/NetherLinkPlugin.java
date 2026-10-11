@@ -1009,8 +1009,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             return "那个槽位是空的：" + slot;
         }
         String spec = st.get("raw").getAsString();
-        String id = cur.getType().getKey().toString();
-        if (buildItem(id, 1, spec) == null) {
+        if (buildMergedItem(cur, spec) == null) {
             return "组件写法有问题，服务器造不出来：" + spec;
         }
         return null;
@@ -1102,6 +1101,40 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * ⚠️ `/item replace ... with` 是**整格覆盖**：不合并就会丢掉原附魔。
      *    所以步骤里的 `raw` 是**要设的组件**，原组件由本方法在 Java 侧保留。
      */
+    /**
+     * 把「原物品」与「LLM 写的组件」合并成一件新物品 ——
+     * **原物品没被 LLM 点名的组件一律原样保留**。
+     *
+     * 🔴 2026-10-11 改：原先是 `buildItem(原id, 原数量, spec)` **整体替换**，
+     *    于是玩家那把剑原有的附魔 / 名字 / lore 全没了（真服实测到过，
+     *    用户说这是「改个名把附魔改没了」）。
+     *
+     * 机制（真 Paper 26.3 实测 + 反编译源码确认）：
+     *    `ItemStack.isDataOverridden(type)` 精确区分「**显式写上去的**组件」
+     *    与「物品类型自带的默认值」。所以把 `spec` 里 overridden 的那些
+     *    拷到原物品上，就正好等于「只改他要改的」。
+     *
+     * ⚠️ 附魔是**整体替换**（写 enchantments 就是换掉整套），
+     *    不是「往里加一条」。这与原版 `/item modify` 一致。
+     *
+     * @param cur  玩家原有的物品（读，不改）
+     * @param spec LLM 写的组件串，如 `custom_name={text:"龙鳞"}`
+     * @return 合并后的新物品；`spec` 造不出来时返回 null
+     */
+    private org.bukkit.inventory.ItemStack buildMergedItem(
+            org.bukkit.inventory.ItemStack cur, String spec) {
+        org.bukkit.inventory.ItemStack temp =
+                buildItem(cur.getType().getKey().toString(), cur.getAmount(), spec);
+        if (temp == null) {
+            return null;
+        }
+        org.bukkit.inventory.ItemStack merged = cur.clone();
+        // 只把 LLM 显式写的那几个组件套上去；其余保持玩家物品原样。
+        merged.copyDataFrom(temp, temp::isDataOverridden);
+        merged.setAmount(cur.getAmount());
+        return merged;
+    }
+
     private String applyModify(Player player, JsonObject st) {
         String slot = st.get("slot").getAsString();
         org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
@@ -1119,9 +1152,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             return "那个槽位是空的：" + slot;
         }
         String spec = st.get("raw").getAsString();
-        String id = cur.getType().getKey().toString();
-        // 把「原物品 id + 玩家要设的组件」造成新物品 —— 数量沿用原来的
-        org.bukkit.inventory.ItemStack built = buildItem(id, cur.getAmount(), spec);
+        // 🔴 **合并**，不是替换：LLM 没点名的组件一律保留玩家原有的
+        //    （见 buildMergedItem 的说明）。
+        org.bukkit.inventory.ItemStack built = buildMergedItem(cur, spec);
         if (built == null) {
             return "组件写法有问题，服务器造不出来：" + spec;
         }
