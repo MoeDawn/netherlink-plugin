@@ -308,6 +308,8 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
+
+
     public String serverName() {
         return serverName;
     }
@@ -901,6 +903,18 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      *    `clear <玩家> <物品> 5` 在只有 2 个时**会把 2 个全清掉**（不是原子失败）。
      *    所以「够不够」必须先问清，否则会出现「扣了一半、后面缺料」。
      */
+    /**
+     * 玩家点了确认：按 steps 执行。
+     *
+     * 🔴 **全部走 Bukkit API，不再下发 /clear /give 指令**（2026-10-11 全换）。
+     *    理由：`/data get` 那条路读物品组件时会**截断**（实测：列表/映射的
+     *    元素超过约 4 个就省略，与字符数无关），而插件是 Java 的、能原生读写
+     *    物品 —— `/data get` 本来就是自己绕的远路。
+     *    顺带消掉 `/clear` 那个「数量不够会全清」的坑（API 是原子的）。
+     *
+     * 🔴 **先全部 check，通过才开始动手**：这是**语义**要求（材料不足就整体
+     *    拒绝），不是实现补丁。
+     */
     private void runSteps(Player player, int token, boolean confirmed) {
         String rawSteps = pendingActions.remove(token);
         if (rawSteps == null) {
@@ -909,38 +923,54 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         try {
             com.google.gson.JsonArray steps = com.google.gson.JsonParser
                     .parseString(rawSteps).getAsJsonArray();
-            var console = Bukkit.createCommandSender(
-                    (net.kyori.adventure.text.Component c) -> { });
-            // ① 先把所有 check 跑完
+            // ① **预校验**：把所有会失败的东西先干跑一遍，任一不过就整体中止。
+            //    ⚠️ 这一步是 2026-10-11 真服实测逼出来的：组件写错是**确定性**的，
+            //    原先只查了材料够不够 ⇒ 材料被扣了、东西没给（半成品状态）。
+            //    `buildItem` 无副作用，所以干跑是安全的。
             for (com.google.gson.JsonElement se : steps) {
                 JsonObject st = se.getAsJsonObject();
-                if (!"check".equals(st.get("op").getAsString())) {
-                    continue;
+                String op = st.get("op").getAsString();
+                String problem = null;
+                if ("check".equals(op)) {
+                    String id = st.get("item").getAsString();
+                    int need = st.get("count").getAsInt();
+                    int have = countItem(player, id);
+                    if (have < need) {
+                        problem = "材料不足：⌜" + stepLabel(st, id) + "⌝ 需要 "
+                                + need + "，你有 " + have;
+                    }
+                } else if ("give".equals(op)) {
+                    // 干跑：造不出来 = 组件写法有问题，现在就该拒绝
+                    String id = st.get("item").getAsString();
+                    String comps = stepComponents(st);
+                    if (buildItem(id, 1, comps) == null) {
+                        problem = "物品写法有问题，服务器造不出来：" + id
+                                + (comps.isEmpty() ? "" : "[" + comps + "]");
+                    }
+                } else if ("modify".equals(op)) {
+                    problem = validateModify(player, st);
                 }
-                String id = st.get("item").getAsString();
-                int need = st.get("count").getAsInt();
-                int have = countItem(console, player, id);
-                if (have < need) {
-                    String disp = st.has("name") && !st.get("name").getAsString().isEmpty()
-                            ? st.get("name").getAsString() : id;
-                    // 用户 2026-10-11：材料不足由 **MC 端私聊**（不经 AstrBot，要立刻看到）
+                if (problem != null) {
+                    // 用户 2026-10-11：失败由 **MC 端私聊**（不经 AstrBot，要立刻看到）
                     player.sendMessage(net.kyori.adventure.text.Component.text(
-                            "材料不足：⌜" + disp + "⌝ 需要 " + need + "，你有 " + have,
-                            net.kyori.adventure.text.format.NamedTextColor.RED));
-                    reportActionResult(token, player.getName(), false, "材料不足：" + disp);
-                    return;   // ⚠️ 一个都不扣
+                            problem, net.kyori.adventure.text.format.NamedTextColor.RED));
+                    reportActionResult(token, player.getName(), false, problem);
+                    return;   // ⚠️ 一个都不动
                 }
             }
             // ② 全通过才开始动手
             for (com.google.gson.JsonElement se : steps) {
                 JsonObject st = se.getAsJsonObject();
                 String op = st.get("op").getAsString();
-                String id = st.get("item").getAsString();
-                int n = st.get("count").getAsInt();
-                if ("clear".equals(op)) {
-                    Bukkit.dispatchCommand(console, "clear " + player.getName() + " " + id + " " + n);
-                } else if ("give".equals(op)) {
-                    Bukkit.dispatchCommand(console, "give " + player.getName() + " " + id + " " + n);
+                if ("check".equals(op)) {
+                    continue;
+                }
+                String err = applyStep(player, st);
+                if (err != null) {
+                    player.sendMessage(net.kyori.adventure.text.Component.text(
+                            err, net.kyori.adventure.text.format.NamedTextColor.RED));
+                    reportActionResult(token, player.getName(), false, err);
+                    return;
                 }
             }
             reportActionResult(token, player.getName(), true, "");
@@ -950,21 +980,214 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    /** 数玩家身上有多少个该物品。用 `clear <玩家> <物品> 0`（只数不清）。 */
-    private int countItem(org.bukkit.command.CommandSender console, Player player, String id) {
+    /** 步骤里的组件串（缺了给空串）。 */
+    private String stepComponents(JsonObject st) {
+        return st.has("components") && !st.get("components").isJsonNull()
+                ? st.get("components").getAsString() : "";
+    }
+
+    /**
+     * 干跑一次 modify：槽位非空 + 组件造得出来。返回 null = 没问题。
+     *
+     * ⚠️ 与 `applyModify` **必须同一口径** —— 这里放过、执行时失败，
+     *    就会留下「扣了材料、东西没改」的半成品。
+     */
+    private String validateModify(Player player, JsonObject st) {
+        String slot = st.get("slot").getAsString();
+        org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
+        org.bukkit.inventory.ItemStack cur;
+        if (es != null) {
+            cur = player.getEquipment().getItem(es);
+        } else {
+            Integer idx = toInventoryIndex(slot);
+            if (idx == null) {
+                return "槽位写法不认识：" + slot;
+            }
+            cur = player.getInventory().getItem(idx);
+        }
+        if (cur == null || cur.getType().isAir()) {
+            return "那个槽位是空的：" + slot;
+        }
+        String spec = st.get("raw").getAsString();
+        String id = cur.getType().getKey().toString();
+        if (buildItem(id, 1, spec) == null) {
+            return "组件写法有问题，服务器造不出来：" + spec;
+        }
+        return null;
+    }
+
+    /** 步骤的显示名（step 里的 name，缺了就用物品 id）。 */
+    private String stepLabel(JsonObject st, String id) {
+        return st.has("name") && !st.get("name").getAsString().isEmpty()
+                ? st.get("name").getAsString() : id;
+    }
+
+    /** 执行一个非 check 的步骤。返回 null = 成功，否则是给玩家看的失败原因。 */
+    private String applyStep(Player player, JsonObject st) {
+        String op = st.get("op").getAsString();
+        // modify 走槽位、不叫 item
+        if ("modify".equals(op)) {
+            return applyModify(player, st);
+        }
+        String id = st.get("item").getAsString();
+        int n = st.get("count").getAsInt();
+        String comps = stepComponents(st);
+        if ("clear".equals(op)) {
+            return takeItems(player, id, n);
+        }
+        if ("give".equals(op)) {
+            return giveItems(player, id, n, comps);
+        }
+        return "未知的步骤类型：" + op;
+    }
+
+    /** 把 `id[组件]` 造成 ItemStack。造不出来返回 null（**不抛**）。 */
+    private org.bukkit.inventory.ItemStack buildItem(String id, int n, String components) {
+        String spec = components == null || components.isEmpty()
+                ? id : id + "[" + components + "]";
         try {
-            StringBuilder out = new StringBuilder();
-            var probe = Bukkit.createCommandSender(
-                    (net.kyori.adventure.text.Component c) ->
-                            out.append(PLAIN.serialize(c)));
-            Bukkit.dispatchCommand(probe, "clear " + player.getName() + " " + id + " 0");
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("(\\d+)").matcher(out.toString());
-            return m.find() ? Integer.parseInt(m.group(1)) : 0;
+            org.bukkit.inventory.ItemStack one =
+                    Bukkit.getItemFactory().createItemStack(spec);
+            one.setAmount(Math.max(1, Math.min(n, one.getMaxStackSize())));
+            return one;
         } catch (Exception e) {
-            getLogger().warning("NetherLink: 数物品失败（" + id + "）: " + e);
+            return null;
+        }
+    }
+
+    /** 发物品；超出一组的按组补。 */
+    private String giveItems(Player player, String id, int n, String components) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, components);
+        if (proto == null) {
+            return "物品写法有问题，服务器造不出来：" + id
+                    + (components.isEmpty() ? "" : "[" + components + "]");
+        }
+        int max = Math.max(1, proto.getMaxStackSize());
+        int left = n;
+        while (left > 0) {
+            int chunk = Math.min(left, max);
+            org.bukkit.inventory.ItemStack part = proto.clone();
+            part.setAmount(chunk);
+            var leftover = player.getInventory().addItem(part);
+            if (!leftover.isEmpty()) {
+                // 背包满了就掉在地上 —— 与 /give 的行为一致，不算失败
+                for (org.bukkit.inventory.ItemStack drop : leftover.values()) {
+                    player.getWorld().dropItemNaturally(player.getLocation(), drop);
+                }
+            }
+            left -= chunk;
+        }
+        return null;
+    }
+
+    /** 扣物品（**原子**：不够就一个都不扣）。 */
+    private String takeItems(Player player, String id, int n) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
+        if (proto == null) {
+            return "物品 ID 有问题：" + id;
+        }
+        int have = countItem(player, id);
+        if (have < n) {
+            return "材料不足：⌜" + id + "⌝ 需要 " + n + "，你有 " + have;
+        }
+        proto.setAmount(n);
+        player.getInventory().removeItem(proto);
+        return null;
+    }
+
+    /**
+     * 改**玩家已有**物品的组件（原地替换，不动别的格子）。
+     *
+     * 🔴 **不是「清掉再给」** —— 那会有复制窗口。这里读出来、改 meta、写回同一格。
+     * ⚠️ `/item replace ... with` 是**整格覆盖**：不合并就会丢掉原附魔。
+     *    所以步骤里的 `raw` 是**要设的组件**，原组件由本方法在 Java 侧保留。
+     */
+    private String applyModify(Player player, JsonObject st) {
+        String slot = st.get("slot").getAsString();
+        org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
+        org.bukkit.inventory.ItemStack cur = null;
+        if (es != null) {
+            cur = player.getEquipment().getItem(es);
+        } else {
+            Integer idx = toInventoryIndex(slot);
+            if (idx == null) {
+                return "槽位写法不认识：" + slot;
+            }
+            cur = player.getInventory().getItem(idx);
+        }
+        if (cur == null || cur.getType().isAir()) {
+            return "那个槽位是空的：" + slot;
+        }
+        String spec = st.get("raw").getAsString();
+        String id = cur.getType().getKey().toString();
+        // 把「原物品 id + 玩家要设的组件」造成新物品 —— 数量沿用原来的
+        org.bukkit.inventory.ItemStack built = buildItem(id, cur.getAmount(), spec);
+        if (built == null) {
+            return "组件写法有问题，服务器造不出来：" + spec;
+        }
+        if (es != null) {
+            player.getEquipment().setItem(es, built);
+        } else {
+            player.getInventory().setItem(toInventoryIndex(slot), built);
+        }
+        return null;
+    }
+
+    /** `weapon.mainhand` / `armor.head` … → EquipmentSlot；不是装备槽返回 null。 */
+    private org.bukkit.inventory.EquipmentSlot toEquipSlot(String slot) {
+        switch (slot) {
+            case "weapon.mainhand":
+            case "weapon":
+                return org.bukkit.inventory.EquipmentSlot.HAND;
+            case "weapon.offhand":
+                return org.bukkit.inventory.EquipmentSlot.OFF_HAND;
+            case "armor.head":
+                return org.bukkit.inventory.EquipmentSlot.HEAD;
+            case "armor.chest":
+                return org.bukkit.inventory.EquipmentSlot.CHEST;
+            case "armor.legs":
+                return org.bukkit.inventory.EquipmentSlot.LEGS;
+            case "armor.feet":
+                return org.bukkit.inventory.EquipmentSlot.FEET;
+            default:
+                return null;
+        }
+    }
+
+    /** `hotbar.N` / `inventory.N` → 背包下标；不是这两种返回 null。 */
+    private Integer toInventoryIndex(String slot) {
+        try {
+            if (slot.startsWith("hotbar.")) {
+                int i = Integer.parseInt(slot.substring("hotbar.".length()));
+                return (i >= 0 && i <= 8) ? i : null;
+            }
+            if (slot.startsWith("inventory.")) {
+                int i = Integer.parseInt(slot.substring("inventory.".length()));
+                return (i >= 9 && i <= 35) ? i : null;
+            }
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * 数玩家身上有多少个该物品（**Bukkit API，不走 `/clear ... 0`**）。
+     *
+     * ⚠️ 只用 id 匹配、不看组件 —— 与 `clear <玩家> <物品> 0` 的口径一致。
+     */
+    private int countItem(Player player, String id) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
+        if (proto == null) {
             return 0;
         }
+        int total = 0;
+        for (org.bukkit.inventory.ItemStack it : player.getInventory().getContents()) {
+            if (it != null && it.getType() == proto.getType()) {
+                total += it.getAmount();
+            }
+        }
+        return total;
     }
 
     /** 回报 AstrBot：执行结果（它据此决定扣不扣好感）。 */
