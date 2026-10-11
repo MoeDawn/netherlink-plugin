@@ -403,11 +403,23 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             String label, net.kyori.adventure.text.format.TextColor color,
             net.kyori.adventure.text.Component hover,
             java.util.function.Consumer<Player> action) {
+        return menuButton(label, color,
+                net.kyori.adventure.text.event.HoverEvent.showText(hover), action);
+    }
+
+    /**
+     * 同上，但悬停事件由调用方给 —— 玩家列表用 `showEntity`
+     * （悬停显示那个玩家实体，与物品栏里悬停玩家一致）。
+     */
+    private net.kyori.adventure.text.Component menuButton(
+            String label, net.kyori.adventure.text.format.TextColor color,
+            net.kyori.adventure.text.event.HoverEvent<?> hover,
+            java.util.function.Consumer<Player> action) {
         return net.kyori.adventure.text.Component.text()
                 .append(net.kyori.adventure.text.Component.text("[ " + label + " ]")
                         .decorate(net.kyori.adventure.text.format.TextDecoration.BOLD))
                 .color(color)
-                .hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(hover))
+                .hoverEvent(hover)
                 .clickEvent(net.kyori.adventure.text.event.ClickEvent.callback(
                         (net.kyori.adventure.audience.Audience audience) -> {
                             if (!(audience instanceof Player clicker)) {
@@ -477,11 +489,17 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 // 🔴 **把目标名字捕获进闭包**，不编码序号 —— 序号会因玩家进出而
                 //    错位，名字才是身份。执行时按名字**重新查**（spec §7.5 裁决 2）。
                 final String name = target.getName();
+                // 🔴 悬停用 `show_entity`（用户 2026-10-11 提议）：显示那个玩家
+                //    实体本身，与物品栏里悬停玩家一致。需要 uuid（当场取，
+                //    同上面的「不信索引」同理，名字才是身份、uuid 只用于展示）。
                 player.sendMessage(net.kyori.adventure.text.Component.text()
                         .append(net.kyori.adventure.text.Component.space())
                         .append(menuButton(name,
                                 net.kyori.adventure.text.format.NamedTextColor.GREEN,
-                                net.kyori.adventure.text.Component.text("点击传送到 " + name),
+                                net.kyori.adventure.text.event.HoverEvent.showEntity(
+                                        net.kyori.adventure.key.Key.key("minecraft:player"),
+                                        target.getUniqueId(),
+                                        net.kyori.adventure.text.Component.text(name)),
                                 p -> teleportToPlayerByName(p, name)))
                         .build());
             }
@@ -778,6 +796,67 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * 版式（用户 2026-10-11 定）：只保留**横线 + 表头**，不用竖线/制表符
      * —— 内容长短不一，制表符会撑破排版。
      */
+    /**
+     * 卡片上要显示的那件物品 —— **带完整组件**，供 `asHoverEvent()` 造 hover。
+     *
+     * 取值优先级：
+     *   ① 卡片的项带 `components` ⇒ 当场造 `id[组件]`
+     *   ② **上一行**（同一行）标了 `slots` ⇒ 去读玩家那个**真实物品**
+     *      （`modify_item` 改的是他身上那件，组件只有服务器知道）
+     *   ③ 都没有 ⇒ 裸物品
+     *
+     * ⚠️ `show_item.count` 有 `intRange(1,99)`（`ItemStackTemplate.MAP_CODEC`），
+     *    超上限整张卡都发不出去 ⇒ 夹到 99。数量本来就另有 `×n` 文本展示，
+     *    组件才是 hover 要的东西。
+     */
+    private org.bukkit.inventory.ItemStack cardItemStack(
+            Player player, JsonObject line, JsonObject it, String id, int n,
+            java.util.Map<String, org.bukkit.inventory.ItemStack> slotCache) {
+        String comps = it.has("components") && !it.get("components").isJsonNull()
+                ? it.get("components").getAsString() : "";
+        if (comps.isEmpty() && line.has("slots")) {
+            // 从玩家身上读真实物品（`modify_item` 的 targets）
+            for (com.google.gson.JsonElement se : line.getAsJsonArray("slots")) {
+                String slot = se.getAsString();
+                org.bukkit.inventory.ItemStack real = slotCache.get(slot);
+                if (real == null) {
+                    real = readSlot(player, slot);
+                    slotCache.put(slot, real);
+                }
+                if (real != null && !real.getType().isAir()) {
+                    return real;
+                }
+            }
+        }
+        // 组件可能写得不合法 —— 那就退回裸物品（卡片宁可少点信息也不能发不出去）
+        org.bukkit.inventory.ItemStack one = comps.isEmpty() ? null : buildItem(
+                id.contains(":") ? id : "minecraft:" + id, 1, comps);
+        if (one == null) {
+            // 组件写错时 **响亮留痕** —— 否则玩家悬停看到的是普通物品，
+            // 而卡片上的名字却是「绝影」，两者对不上、没人查得出为什么。
+            getLogger().warning("NetherLink: 卡片物品的组件造不出来，悬停退回裸物品 | id="
+                    + id + " components=" + comps);
+            one = buildItem(id.contains(":") ? id : "minecraft:" + id,
+                    Math.max(1, Math.min(n, 99)), "");
+        }
+        if (one == null) {
+            // 连裸物品都造不出来（id 写错了）—— 极罕见，给个石头占位
+            one = new org.bukkit.inventory.ItemStack(org.bukkit.Material.STONE);
+        }
+        one.setAmount(Math.max(1, Math.min(n, 99)));
+        return one;
+    }
+
+    /** 读玩家某个槽位上的物品（`weapon.mainhand` / `armor.head` / `hotbar.3` …）。 */
+    private org.bukkit.inventory.ItemStack readSlot(Player player, String slot) {
+        org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
+        if (es != null) {
+            return player.getEquipment().getItem(es);
+        }
+        Integer idx = toInventoryIndex(slot);
+        return idx == null ? null : player.getInventory().getItem(idx);
+    }
+
     private void sendConfirmCard(Player player, int token, JsonObject card) {
         try {
             String title = card.has("title") ? card.get("title").getAsString() : "确认请求";
@@ -803,9 +882,16 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                                 line.get("label").getAsString() + ": ",
                                 net.kyori.adventure.text.format.NamedTextColor.GRAY))
                         .build();
-                Player target = player;
-                // 逐项：显示名 + show_item hover（hover 恒在 —— 玩家自己看真物品）
+                // 逐项：显示名 + **真物品 hover**。
+                // 🔴 2026-10-11 改：原先是 `HoverEvent.showItem(Key, n)`，那只带
+                //    物品 id，玩家悬停看到的是**普通版本**（真服实测 dataComponents(0)）。
+                //    现在用 `ItemStack.asHoverEvent()`，带完整组件（实测 4 个），
+                //    悬停所见与玩家在物品栏里一致。
                 if (line.has("items")) {
+                    // 这一行若标了槽位（modify_item：改玩家自己那件），
+                    // 组件只能从**真实物品**上取 —— 建一次读缓存，别每个都读。
+                    java.util.Map<String, org.bukkit.inventory.ItemStack> slotCache =
+                            new java.util.HashMap<>();
                     for (com.google.gson.JsonElement ie : line.getAsJsonArray("items")) {
                         JsonObject it = ie.getAsJsonObject();
                         String id = it.get("id").getAsString();
@@ -815,14 +901,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         net.kyori.adventure.text.Component chunk =
                                 net.kyori.adventure.text.Component.text("[" + disp + "]",
                                         net.kyori.adventure.text.format.NamedTextColor.AQUA);
-                        // ⚠️ show_item.count 上限 99（源码 intRange(1,99)），
-                        //    超了整张卡发不出去 —— 超了就**不带数量**，别撒谎
-                        net.kyori.adventure.key.Key key =
-                                net.kyori.adventure.key.Key.key(id.contains(":")
-                                        ? id : "minecraft:" + id);
-                        chunk = chunk.hoverEvent(n <= 99
-                                ? net.kyori.adventure.text.event.HoverEvent.showItem(key, n)
-                                : net.kyori.adventure.text.event.HoverEvent.showItem(key, 1));
+                        org.bukkit.inventory.ItemStack show =
+                                cardItemStack(player, line, it, id, n, slotCache);
+                        chunk = chunk.hoverEvent(show.asHoverEvent());
                         row = row.append(chunk).append(
                                 net.kyori.adventure.text.Component.text(" ×" + n + "  "));
                     }
