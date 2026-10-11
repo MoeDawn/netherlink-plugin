@@ -308,8 +308,6 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
-
-
     public String serverName() {
         return serverName;
     }
@@ -728,7 +726,6 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         });
     }
 
-
     // ------------------------------------------------------------------
     // 确认卡（来自 AstrBot 的 action_offer）
     //
@@ -934,7 +931,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 if ("check".equals(op)) {
                     String id = st.get("item").getAsString();
                     int need = st.get("count").getAsInt();
-                    int have = countItem(player, id);
+                    int have = countItem(player, id, stepComponents(st));
                     if (have < need) {
                         problem = "材料不足：⌜" + stepLabel(st, id) + "⌝ 需要 "
                                 + need + "，你有 " + have;
@@ -1032,7 +1029,10 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         int n = st.get("count").getAsInt();
         String comps = stepComponents(st);
         if ("clear".equals(op)) {
-            return takeItems(player, id, n);
+            // 🔴 2026-10-11 审计发现：这里原先是 `takeItems(player, id, n)`
+            //    —— **丢掉了 `comps`**。于是 `swap_items` 的 `pay` 即便写了
+            //    组件也按类型清，可能收走玩家背包里另一把同 id 的物品。
+            return takeItems(player, id, n, comps);
         }
         if ("give".equals(op)) {
             return giveItems(player, id, n, comps);
@@ -1080,27 +1080,61 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     }
 
     /** 扣物品（**原子**：不够就一个都不扣）。 */
-    private String takeItems(Player player, String id, int n) {
-        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
+    /**
+     * 从背包扣掉 `n` 个。
+     *
+     * 🔴 **给了组件就按组件精确匹配**（2026-10-11 审计补）。原先只按
+     * `getType()` 匹配，于是「升级我这把附魔剑」可能收走背包里另一把
+     * 同 id 的普通剑。`components` 为空时保持**只比类型**的老行为
+     * （`swap_items` 交普通材料时不能因为玩家改过名就扣不到）。
+     *
+     * ⚠️ 判据必须与 `countItem` **完全一致** —— 两处不一致会出现
+     *    「check 说有、clear 说没有」，或者 check 放过而 clear 多拿。
+     */
+    private String takeItems(Player player, String id, int n, String components) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, components);
         if (proto == null) {
-            return "物品 ID 有问题：" + id;
+            return "物品写法有问题，服务器造不出来：" + id
+                    + (components.isEmpty() ? "" : "[" + components + "]");
         }
-        int have = countItem(player, id);
+        int have = countItem(player, id, components);
         if (have < n) {
             return "材料不足：⌜" + id + "⌝ 需要 " + n + "，你有 " + have;
         }
-        proto.setAmount(n);
-        player.getInventory().removeItem(proto);
+        boolean exact = components != null && !components.isEmpty();
+        int left = n;
+        org.bukkit.inventory.ItemStack[] contents = player.getInventory().getContents();
+        for (int i = 0; i < contents.length && left > 0; i++) {
+            org.bukkit.inventory.ItemStack it = contents[i];
+            if (it == null || !matchesKind(it, proto, exact)) {
+                continue;
+            }
+            int take = Math.min(left, it.getAmount());
+            it.setAmount(it.getAmount() - take);
+            left -= take;
+            if (it.getAmount() <= 0) {
+                player.getInventory().setItem(i, null);
+            }
+        }
         return null;
     }
 
     /**
-     * 改**玩家已有**物品的组件（原地替换，不动别的格子）。
+     * 背包里那件 `have` 算不算「和 `proto` 同一种」。
      *
-     * 🔴 **不是「清掉再给」** —— 那会有复制窗口。这里读出来、改 meta、写回同一格。
-     * ⚠️ `/item replace ... with` 是**整格覆盖**：不合并就会丢掉原附魔。
-     *    所以步骤里的 `raw` 是**要设的组件**，原组件由本方法在 Java 侧保留。
+     * `exact=false`（调用方没给组件）⇒ **只比类型**，老行为。
+     * `exact=true`          ⇒ 走 `isSimilar`，**忽略数量、尊重组件**。
+     *   （真服实测：裸1 vs 裸3 = true；名字A vs 名字B = false）
      */
+    private boolean matchesKind(org.bukkit.inventory.ItemStack have,
+                                org.bukkit.inventory.ItemStack proto,
+                                boolean exact) {
+        if (have.getType() != proto.getType()) {
+            return false;
+        }
+        return !exact || have.isSimilar(proto);
+    }
+
     /**
      * 把「原物品」与「LLM 写的组件」合并成一件新物品 ——
      * **原物品没被 LLM 点名的组件一律原样保留**。
@@ -1135,6 +1169,12 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         return merged;
     }
 
+    /**
+     * 改**玩家已有**物品的组件（**原地替换同一格**，不动别的格子）。
+     *
+     * 🔴 **不是「清掉再给」** —— 那会有复制窗口。这里读出来、合并组件、写回同一格。
+     *    合并由 `buildMergedItem` 做：LLM 没点名的组件一律保留玩家原有的。
+     */
     private String applyModify(Player player, JsonObject st) {
         String slot = st.get("slot").getAsString();
         org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
@@ -1209,14 +1249,20 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      *
      * ⚠️ 只用 id 匹配、不看组件 —— 与 `clear <玩家> <物品> 0` 的口径一致。
      */
-    private int countItem(Player player, String id) {
-        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
+    /**
+     * 数背包里有几个。
+     *
+     * 🔴 判据必须与 `takeItems` **完全一致**（见那里的说明）。
+     */
+    private int countItem(Player player, String id, String components) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, components);
         if (proto == null) {
             return 0;
         }
+        boolean exact = components != null && !components.isEmpty();
         int total = 0;
         for (org.bukkit.inventory.ItemStack it : player.getInventory().getContents()) {
-            if (it != null && it.getType() == proto.getType()) {
+            if (it != null && matchesKind(it, proto, exact)) {
                 total += it.getAmount();
             }
         }

@@ -30,6 +30,11 @@ NetherLink 的 MC 端 **Paper / Purpur / Folia** 插件——配套 AstrBot 上�
   `ItemStack.copyDataFrom` + `isDataOverridden`，后者区分
   「显式写上去的组件」与「物品类型自带的默认值」）。
   ⚠️ 例外：**附魔是整套替换**（写 `enchantments` 就换掉整组），与原版一致。
+- **收材料时可能收走错的那一件**。`clear` 原先只按物品**类型**匹配，
+  于是「把这把附魔剑升级一下」有可能收走背包里另一把同 id 的普通剑。
+  改为：**给了组件就按组件精确匹配**（`ItemStack.isSimilar`，
+  忽略数量、尊重组件），没给组件时保持只比类型的老行为。
+  `countItem` 与 `takeItems` 共用同一判据。
 - 菜单提示里的菱形符号显示成字面量（转义多写了一层）。
 - 主菜单项没有悬浮说明。
 - `/trigger` 用完会自锁，导致确认卡第二张点不动。
