@@ -977,21 +977,13 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     /**
      * 玩家点了确认：按 steps 执行。
      *
-     * 🔴 **先全部 check，通过才开始 clear/give** —— 真服实测
-     *    `clear <玩家> <物品> 5` 在只有 2 个时**会把 2 个全清掉**（不是原子失败）。
-     *    所以「够不够」必须先问清，否则会出现「扣了一半、后面缺料」。
-     */
-    /**
-     * 玩家点了确认：按 steps 执行。
-     *
-     * 🔴 **全部走 Bukkit API，不再下发 /clear /give 指令**（2026-10-11 全换）。
-     *    理由：`/data get` 那条路读物品组件时会**截断**（实测：列表/映射的
-     *    元素超过约 4 个就省略，与字符数无关），而插件是 Java 的、能原生读写
-     *    物品 —— `/data get` 本来就是自己绕的远路。
-     *    顺带消掉 `/clear` 那个「数量不够会全清」的坑（API 是原子的）。
+     * 🔴 **全部走 Bukkit API，不下发 `/clear` `/give` 指令**（2026-10-11 全换）。
+     *    理由是 `/data get` 读物品组件那层嵌套结构会被折叠，而插件是 Java 的、
+     *    能原生读写物品 —— 那条路本来就是自己绕的远路。
      *
      * 🔴 **先全部 check，通过才开始动手**：这是**语义**要求（材料不足就整体
-     *    拒绝），不是实现补丁。
+     *    拒绝），不是实现补丁。真服实测 `clear <玩家> <物品> 5` 在只有 2 个时
+     *    **会把 2 个全清掉** —— 所以「够不够」必须先问清，否则会「扣了一半」。
      */
     private void runSteps(Player player, int token, boolean confirmed) {
         String rawSteps = pendingActions.remove(token);
