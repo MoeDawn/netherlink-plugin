@@ -2,6 +2,31 @@
 
 > 本文件用于 GitHub Release 的说明。格式参考 AstrBot 侧插件的 `CHANGELOG.md`。
 
+## v0.1.2
+
+NetherLink 的 MC 端 **Paper / Purpur / Folia** 插件——配套 AstrBot 上的 NetherLink 插件使用。
+
+### 新增
+
+- **本地菜单**：公屏发 `菜单` / `menu` / `メニュー`，私聊弹出一张可点击菜单，点按钮传送。
+  **全程在本端完成，不经 AstrBot、不消耗好感、离线也能用**。
+  两项：传送到玩家、传送到死亡点（都免费）。
+- **确认卡渲染**：AstrBot 发来 `action_offer` 后由本端渲染卡片并执行
+  —— 按钮用 Paper 原生点击回调，**不用计分板**（无多余回显、点了立即生效）。
+
+### 变更
+
+- 物品的 `check` / `clear` / `give` / `modify` **全部改用 Bukkit API**，
+  不再下发 `/clear` `/give` 指令。顺带消掉 `/clear` 数量不够时「整摞清光」的行为。
+- 执行前多一道**预校验**：材料够不够、组件造不造得出来、槽位空不空——
+  任一不过就整体中止，**一个都不动**。
+
+### 修复
+
+- 菜单提示里的菱形符号显示成字面量（转义多写了一层）。
+- 主菜单项没有悬浮说明。
+- `/trigger` 用完会自锁，导致确认卡第二张点不动。
+
 ## v0.1.1
 
 NetherLink 的 MC 端 **Paper / Purpur / Folia** 插件——配套 AstrBot 上的 NetherLink 插件使用。
