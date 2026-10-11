@@ -662,6 +662,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             switch (type) {
                 case "chat", "bot_reply" -> handleLineDown(data);
                 case "command" -> handleCommandDown(data);
+                case "action_offer" -> handleActionOffer(data);
                 default -> {
                     // hello 应答/未知类型忽略
                 }
@@ -723,6 +724,258 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 sendCommandResult(id, false, "执行异常: " + e.getMessage());
             }
         });
+    }
+
+
+    // ------------------------------------------------------------------
+    // 确认卡（来自 AstrBot 的 action_offer）
+    //
+    // 🔴 **卡片由本端渲染**（不是 AstrBot 拼好的 tellraw JSON）—— 这样才能把
+    //    token 捕获进点击回调的闭包，从而**不需要计分板**：
+    //    无 /trigger 回显、无轮询延迟、无需 players enable、也不会「用完自锁」。
+    //    用户 2026-10-11 真人验证过这套回调可用。
+    //
+    // 🔴 **steps 由 AstrBot 展开**，本端**不认识动作名**，只认三种原子操作：
+    //      check = 只数（不动手）  clear = 扣掉  give = 发放
+    //    加新动作不用改这里。
+    // ------------------------------------------------------------------
+
+    /** 一次待确认的卡片：token → steps（取消时用不着，但留着便于排查）。 */
+    private final java.util.Map<Integer, String> pendingActions = new java.util.HashMap<>();
+
+    private void handleActionOffer(JsonObject data) {
+        final int token = data.has("token") ? data.get("token").getAsInt() : 0;
+        final String playerName = data.has("player") ? data.get("player").getAsString() : "";
+        final JsonObject card = data.has("card") ? data.getAsJsonObject("card") : new JsonObject();
+        final com.google.gson.JsonArray steps = data.has("steps")
+                ? data.getAsJsonArray("steps") : new com.google.gson.JsonArray();
+        if (token == 0 || playerName.isEmpty()) {
+            getLogger().warning("NetherLink: action_offer 缺 token 或 player，忽略");
+            return;
+        }
+        // steps 存成字符串，回调里再解析 —— 闭包只捕获不可变值
+        pendingActions.put(token, steps.toString());
+        Bukkit.getGlobalRegionScheduler().execute(this, () -> {
+            Player p = Bukkit.getPlayerExact(playerName);
+            if (p == null) {
+                // 玩家不在线就没法发卡；回报失败让 AstrBot 不扣好感
+                reportActionResult(token, playerName, false, "玩家不在线");
+                return;
+            }
+            sendConfirmCard(p, token, card);
+        });
+    }
+
+    /** 分隔线（16 个 ━）。 */
+    private net.kyori.adventure.text.Component cardRule() {
+        return net.kyori.adventure.text.Component.text(
+                "━━━━━━━━━━━━━━━━",
+                net.kyori.adventure.text.format.NamedTextColor.DARK_GRAY);
+    }
+
+    /**
+     * 私聊渲染确认卡。
+     *
+     * 版式（用户 2026-10-11 定）：只保留**横线 + 表头**，不用竖线/制表符
+     * —— 内容长短不一，制表符会撑破排版。
+     */
+    private void sendConfirmCard(Player player, int token, JsonObject card) {
+        try {
+            String title = card.has("title") ? card.get("title").getAsString() : "确认请求";
+            // ① 横线
+            player.sendMessage(cardRule());
+            // ② 表头（居中靠前置空格）
+            player.sendMessage(net.kyori.adventure.text.Component.text()
+                    .append(net.kyori.adventure.text.Component.text("      ✦ "))
+                    .append(net.kyori.adventure.text.Component.text(title,
+                            net.kyori.adventure.text.format.NamedTextColor.GOLD,
+                            net.kyori.adventure.text.format.TextDecoration.BOLD))
+                    .append(net.kyori.adventure.text.Component.text(" ✦"))
+                    .build());
+            player.sendMessage(net.kyori.adventure.text.Component.empty());
+            // ③ 主体：每个 line 一行
+            com.google.gson.JsonArray lines = card.has("lines")
+                    ? card.getAsJsonArray("lines") : new com.google.gson.JsonArray();
+            for (com.google.gson.JsonElement le : lines) {
+                JsonObject line = le.getAsJsonObject();
+                net.kyori.adventure.text.Component row = net.kyori.adventure.text.Component.text()
+                        .append(net.kyori.adventure.text.Component.text("  "))
+                        .append(net.kyori.adventure.text.Component.text(
+                                line.get("label").getAsString() + ": ",
+                                net.kyori.adventure.text.format.NamedTextColor.GRAY))
+                        .build();
+                Player target = player;
+                // 逐项：显示名 + show_item hover（hover 恒在 —— 玩家自己看真物品）
+                if (line.has("items")) {
+                    for (com.google.gson.JsonElement ie : line.getAsJsonArray("items")) {
+                        JsonObject it = ie.getAsJsonObject();
+                        String id = it.get("id").getAsString();
+                        int n = it.has("count") ? it.get("count").getAsInt() : 1;
+                        String disp = it.has("name") && !it.get("name").getAsString().isEmpty()
+                                ? it.get("name").getAsString() : id;
+                        net.kyori.adventure.text.Component chunk =
+                                net.kyori.adventure.text.Component.text("[" + disp + "]",
+                                        net.kyori.adventure.text.format.NamedTextColor.AQUA);
+                        // ⚠️ show_item.count 上限 99（源码 intRange(1,99)），
+                        //    超了整张卡发不出去 —— 超了就**不带数量**，别撒谎
+                        net.kyori.adventure.key.Key key =
+                                net.kyori.adventure.key.Key.key(id.contains(":")
+                                        ? id : "minecraft:" + id);
+                        chunk = chunk.hoverEvent(n <= 99
+                                ? net.kyori.adventure.text.event.HoverEvent.showItem(key, n)
+                                : net.kyori.adventure.text.event.HoverEvent.showItem(key, 1));
+                        row = row.append(chunk).append(
+                                net.kyori.adventure.text.Component.text(" ×" + n + "  "));
+                    }
+                }
+                if (line.has("text")) {
+                    row = row.append(net.kyori.adventure.text.Component.text(
+                            line.get("text").getAsString(),
+                            net.kyori.adventure.text.format.NamedTextColor.WHITE));
+                }
+                player.sendMessage(row);
+            }
+            // ④ 花费
+            if (card.has("cost_value") && card.get("cost_value").getAsInt() > 0) {
+                player.sendMessage(net.kyori.adventure.text.Component.text()
+                        .append(net.kyori.adventure.text.Component.text("  花费 "))
+                        .append(net.kyori.adventure.text.Component.text(
+                                String.valueOf(card.get("cost_value").getAsInt()),
+                                net.kyori.adventure.text.format.NamedTextColor.YELLOW))
+                        .append(net.kyori.adventure.text.Component.text(" 好感"))
+                        .build());
+            }
+            player.sendMessage(net.kyori.adventure.text.Component.empty());
+            // ⑤ 两个按钮，**单独一行**，各自带 hover
+            String ch = card.has("confirm_hover") ? card.get("confirm_hover").getAsString()
+                    : "同意";
+            String xh = card.has("cancel_hover") ? card.get("cancel_hover").getAsString()
+                    : "否决，无消耗";
+            player.sendMessage(net.kyori.adventure.text.Component.text()
+                    .append(net.kyori.adventure.text.Component.text("  "))
+                    .append(actionButton("[ 确认 ]",
+                            net.kyori.adventure.text.format.NamedTextColor.GREEN, ch,
+                            () -> runSteps(player, token, true)))
+                    .append(net.kyori.adventure.text.Component.text("    "))
+                    .append(actionButton("[ 取消 ]",
+                            net.kyori.adventure.text.format.NamedTextColor.RED, xh,
+                            () -> {
+                                pendingActions.remove(token);
+                                player.sendMessage(net.kyori.adventure.text.Component.text(
+                                        "已取消。",
+                                        net.kyori.adventure.text.format.NamedTextColor.GRAY));
+                                reportActionResult(token, player.getName(), false, "玩家取消");
+                            }))
+                    .build());
+            player.sendMessage(cardRule());
+        } catch (Exception e) {
+            getLogger().warning("NetherLink: 渲染确认卡失败（" + player.getName() + "）: " + e);
+        }
+    }
+
+    /** 一个带 hover 的可点击按钮；点了在主线程跑 `action`。 */
+    private net.kyori.adventure.text.Component actionButton(
+            String label, net.kyori.adventure.text.format.TextColor color,
+            String hover, Runnable action) {
+        return net.kyori.adventure.text.Component.text(label)
+                .color(color)
+                .decorate(net.kyori.adventure.text.format.TextDecoration.BOLD)
+                .hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(
+                        net.kyori.adventure.text.Component.text(hover)))
+                .clickEvent(net.kyori.adventure.text.event.ClickEvent.callback(
+                        (net.kyori.adventure.audience.Audience audience) -> {
+                            if (!(audience instanceof Player)) {
+                                return;
+                            }
+                            Bukkit.getGlobalRegionScheduler().execute(this, action);
+                        },
+                        opts -> opts
+                                .uses(net.kyori.adventure.text.event.ClickCallback.UNLIMITED_USES)
+                                .lifetime(java.time.Duration.ofHours(1))));
+    }
+
+    /**
+     * 玩家点了确认：按 steps 执行。
+     *
+     * 🔴 **先全部 check，通过才开始 clear/give** —— 真服实测
+     *    `clear <玩家> <物品> 5` 在只有 2 个时**会把 2 个全清掉**（不是原子失败）。
+     *    所以「够不够」必须先问清，否则会出现「扣了一半、后面缺料」。
+     */
+    private void runSteps(Player player, int token, boolean confirmed) {
+        String rawSteps = pendingActions.remove(token);
+        if (rawSteps == null) {
+            return;   // 已经处理过
+        }
+        try {
+            com.google.gson.JsonArray steps = com.google.gson.JsonParser
+                    .parseString(rawSteps).getAsJsonArray();
+            var console = Bukkit.createCommandSender(
+                    (net.kyori.adventure.text.Component c) -> { });
+            // ① 先把所有 check 跑完
+            for (com.google.gson.JsonElement se : steps) {
+                JsonObject st = se.getAsJsonObject();
+                if (!"check".equals(st.get("op").getAsString())) {
+                    continue;
+                }
+                String id = st.get("item").getAsString();
+                int need = st.get("count").getAsInt();
+                int have = countItem(console, player, id);
+                if (have < need) {
+                    String disp = st.has("name") && !st.get("name").getAsString().isEmpty()
+                            ? st.get("name").getAsString() : id;
+                    // 用户 2026-10-11：材料不足由 **MC 端私聊**（不经 AstrBot，要立刻看到）
+                    player.sendMessage(net.kyori.adventure.text.Component.text(
+                            "材料不足：⌜" + disp + "⌝ 需要 " + need + "，你有 " + have,
+                            net.kyori.adventure.text.format.NamedTextColor.RED));
+                    reportActionResult(token, player.getName(), false, "材料不足：" + disp);
+                    return;   // ⚠️ 一个都不扣
+                }
+            }
+            // ② 全通过才开始动手
+            for (com.google.gson.JsonElement se : steps) {
+                JsonObject st = se.getAsJsonObject();
+                String op = st.get("op").getAsString();
+                String id = st.get("item").getAsString();
+                int n = st.get("count").getAsInt();
+                if ("clear".equals(op)) {
+                    Bukkit.dispatchCommand(console, "clear " + player.getName() + " " + id + " " + n);
+                } else if ("give".equals(op)) {
+                    Bukkit.dispatchCommand(console, "give " + player.getName() + " " + id + " " + n);
+                }
+            }
+            reportActionResult(token, player.getName(), true, "");
+        } catch (Exception e) {
+            getLogger().warning("NetherLink: 执行 steps 失败（" + player.getName() + "）: " + e);
+            reportActionResult(token, player.getName(), false, "执行异常：" + e.getMessage());
+        }
+    }
+
+    /** 数玩家身上有多少个该物品。用 `clear <玩家> <物品> 0`（只数不清）。 */
+    private int countItem(org.bukkit.command.CommandSender console, Player player, String id) {
+        try {
+            StringBuilder out = new StringBuilder();
+            var probe = Bukkit.createCommandSender(
+                    (net.kyori.adventure.text.Component c) ->
+                            out.append(PLAIN.serialize(c)));
+            Bukkit.dispatchCommand(probe, "clear " + player.getName() + " " + id + " 0");
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(\\d+)").matcher(out.toString());
+            return m.find() ? Integer.parseInt(m.group(1)) : 0;
+        } catch (Exception e) {
+            getLogger().warning("NetherLink: 数物品失败（" + id + "）: " + e);
+            return 0;
+        }
+    }
+
+    /** 回报 AstrBot：执行结果（它据此决定扣不扣好感）。 */
+    private void reportActionResult(int token, String player, boolean ok, String detail) {
+        JsonObject o = new JsonObject();
+        o.addProperty("type", "action_result");
+        o.addProperty("token", token);
+        o.addProperty("player", player);
+        o.addProperty("ok", ok);
+        o.addProperty("detail", detail);
+        report(o);
     }
 
     private void sendCommandResult(String id, boolean ok, String output) {
