@@ -4,6 +4,8 @@ build/
 *.jar
 # 例外：wrapper jar 是构建必需的，必须入库
 !gradle/wrapper/gradle-wrapper.jar
+# IDE 的编译输出目录（丢的是 .class 与 paper-plugin.yml 的副本）
+bin/
 
 # IDE
 .idea/
