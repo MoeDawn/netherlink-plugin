@@ -778,6 +778,11 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 case "chat", "bot_reply" -> handleLineDown(data);
                 case "command" -> handleCommandDown(data);
                 case "action_offer" -> handleActionOffer(data);
+                // 🔴 **查玩家物品**（用户 2026-10-12 定案）：只读、把组件序列化成
+                //    **给 AI 看的文本**回上去 —— 这样 AI 不用再手写 `data get`
+                //    （它没有 26.3 的训练数据，那正是坑 13 要消灭的事）。
+                //    ⚠️ 结果**不给玩家看**：AI 拿到后自己组织回话。
+                case "inspect" -> handleInspect(data);
                 default -> {
                     // hello 应答/未知类型忽略
                 }
@@ -877,6 +882,173 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         final net.kyori.adventure.text.Component rendered = out;
         Bukkit.getGlobalRegionScheduler().execute(
                 this, () -> getServer().broadcast(rendered));
+    }
+
+    /**
+     * 查玩家背包，把结果序列化成**给 AI 读的文本**。
+     *
+     * 入帧 `{type:"inspect", id, player, slot?, match?, limit?}`；
+     * 出帧 `{type:"inspect_result", id, text}`。
+     *
+     * 🔴 **只读** —— 不动任何东西、不消耗好感。四个参数（用户 2026-10-12 定）：
+     *    `player` 必填；`slot` / `match` 至少给一个（都给 = 那一格里名字像 X 的）；
+     *    `limit` 默认 10。
+     * ⚠️ 组件走 Paper 的 `getData(DataComponentTypes.X)` **结构化读**，
+     *    不用 `/data get`（那会截断列表）。
+     */
+    private void handleInspect(JsonObject data) {
+        String id = data.has("id") ? data.get("id").getAsString() : "";
+        String playerName = data.has("player") ? data.get("player").getAsString() : "";
+        String wantSlot = data.has("slot") ? data.get("slot").getAsString().strip() : "";
+        String match = data.has("match") ? data.get("match").getAsString().strip() : "";
+        int limit = data.has("limit") ? data.get("limit").getAsInt() : 10;
+        if (limit <= 0) {
+            limit = 10;
+        }
+        Player p = Bukkit.getPlayerExact(playerName);
+        if (p == null) {
+            reportInspect(id, "玩家 " + playerName + " 不在线，查不到。");
+            return;
+        }
+        java.util.List<String> slots = new java.util.ArrayList<>(allSlots());
+        if (!wantSlot.isEmpty()) {
+            if (!allSlots().contains(wantSlot)) {
+                reportInspect(id, "槽位 " + wantSlot + " 不认识。可用："
+                        + String.join(" / ", allSlots()));
+                return;
+            }
+            slots.clear();
+            slots.add(wantSlot);
+        }
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        for (String slot : slots) {
+            org.bukkit.inventory.ItemStack it = readSlot(p, slot);
+            if (it == null || it.getType().isAir()) {
+                continue;
+            }
+            if (!match.isEmpty() && !matchesName(it, match)) {
+                continue;
+            }
+            lines.add(formatItemForAi(it, slot));
+            if (lines.size() >= limit) {
+                break;
+            }
+        }
+        if (lines.isEmpty()) {
+            StringBuilder q = new StringBuilder();
+            q.append("槽位=").append(wantSlot.isEmpty() ? "全部" : wantSlot);
+            if (!match.isEmpty()) {
+                q.append("，名字含「").append(match).append("」");
+            }
+            reportInspect(id, playerName + " 那里没查到符合的物品（" + q + "）。");
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(playerName).append(" 查到 ").append(lines.size()).append(" 件：\n");
+        for (int i = 0; i < lines.size(); i++) {
+            sb.append(i + 1).append(". ").append(lines.get(i)).append('\n');
+        }
+        if (lines.size() >= limit) {
+            sb.append("（只列了前 ").append(limit)
+              .append(" 件 —— 要更多就加 slot 或 match 把范围收窄）");
+        }
+        reportInspect(id, sb.toString().strip());
+    }
+
+    private static java.util.List<String> ALL_SLOTS_CACHE = null;
+
+    /** 身上 + 背包的全部槽位名（手上 → 装备 → 快捷栏 → 背包）。 */
+    private java.util.List<String> allSlots() {
+        if (ALL_SLOTS_CACHE == null) {
+            java.util.List<String> out = new java.util.ArrayList<>();
+            out.add("weapon.mainhand");
+            out.add("weapon.offhand");
+            out.add("armor.head");
+            out.add("armor.chest");
+            out.add("armor.legs");
+            out.add("armor.feet");
+            for (int i = 0; i < 9; i++) {
+                out.add("hotbar." + i);
+            }
+            for (int i = 9; i < 36; i++) {
+                out.add("inventory." + i);
+            }
+            ALL_SLOTS_CACHE = java.util.Collections.unmodifiableList(out);
+        }
+        return ALL_SLOTS_CACHE;
+    }
+
+    /** 名字或物品 ID 里含 `match`（不区分大小写）就算命中。 */
+    private boolean matchesName(org.bukkit.inventory.ItemStack it, String match) {
+        String m = match.toLowerCase();
+        if (it.getType().getKey().toString().toLowerCase().contains(m)) {
+            return true;
+        }
+        return PLAIN.serialize(it.effectiveName()).toLowerCase().contains(m);
+    }
+
+    /**
+     * 一件物品 → **给 AI 读的一段**（首行带**物品 ID**，AI 拿它去填别的动作参数）。
+     */
+    private String formatItemForAi(org.bukkit.inventory.ItemStack it, String slot) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("⌜").append(PLAIN.serialize(it.effectiveName())).append("⌝ (")
+          .append(it.getType().getKey()).append(") ×").append(it.getAmount())
+          .append("   [").append(slot).append(']');
+        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.ENCHANTMENTS)) {
+            java.util.List<String> es = new java.util.ArrayList<>();
+            for (java.util.Map.Entry<org.bukkit.enchantments.Enchantment, Integer> e
+                    : it.getData(io.papermc.paper.datacomponent.DataComponentTypes.ENCHANTMENTS)
+                            .enchantments().entrySet()) {
+                es.add(e.getKey().getKey().getKey() + " " + e.getValue());
+            }
+            if (!es.isEmpty()) {
+                sb.append("\n   附魔: ").append(String.join(", ", es));
+            }
+        }
+        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.ATTRIBUTE_MODIFIERS)) {
+            java.util.List<String> as = new java.util.ArrayList<>();
+            for (io.papermc.paper.datacomponent.item.ItemAttributeModifiers.Entry e
+                    : it.getData(io.papermc.paper.datacomponent.DataComponentTypes
+                            .ATTRIBUTE_MODIFIERS).modifiers()) {
+                as.add((e.modifier().getAmount() >= 0 ? "+" : "")
+                        + e.modifier().getAmount() + " "
+                        + e.attribute().getKey().getKey() + " ("
+                        + e.modifier().getOperation().name().toLowerCase() + ")");
+            }
+            if (!as.isEmpty()) {
+                sb.append("\n   属性: ").append(String.join(", ", as));
+            }
+        }
+        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.LORE)) {
+            java.util.List<String> ls = new java.util.ArrayList<>();
+            for (net.kyori.adventure.text.Component c
+                    : it.getData(io.papermc.paper.datacomponent.DataComponentTypes.LORE)
+                            .lines()) {
+                ls.add(PLAIN.serialize(c));
+            }
+            if (!ls.isEmpty()) {
+                sb.append("\n   说明: ").append(String.join(" / ", ls));
+            }
+        }
+        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.UNBREAKABLE)) {
+            sb.append("\n   不可破坏");
+        }
+        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.RARITY)) {
+            Object r = it.getData(io.papermc.paper.datacomponent.DataComponentTypes.RARITY);
+            if (!"COMMON".equals(String.valueOf(r))) {
+                sb.append("\n   稀有度: ").append(r);
+            }
+        }
+        return sb.toString();
+    }
+
+    private void reportInspect(String id, String text) {
+        JsonObject o = new JsonObject();
+        o.addProperty("type", "inspect_result");
+        o.addProperty("id", id);
+        o.addProperty("text", text);
+        report(o);
     }
 
     private void handleCommandDown(JsonObject data) {
