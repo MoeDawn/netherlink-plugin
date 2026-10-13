@@ -995,7 +995,13 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         sb.append("⌜").append(PLAIN.serialize(it.effectiveName())).append("⌝ (")
           .append(it.getType().getKey()).append(") ×").append(it.getAmount())
           .append("   [").append(slot).append(']');
-        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.ENCHANTMENTS)) {
+        // 🔴 **只报「显式写上去的」组件**（`isDataOverridden`）—— 真机实测：
+        //    钻石剑自带 `attack_speed -2.4`，若一并报出去，AI 会把它照抄进
+        //    `components`，**把物品类型的默认值写死**。
+        //    而且这个工具的返回值要能**直接填回**别的动作参数，所以只报
+        //    「玩家/服主真加过的那部分」才对。
+        // 附魔（整套）
+        if (isOverridden(it, io.papermc.paper.datacomponent.DataComponentTypes.ENCHANTMENTS)) {
             java.util.List<String> es = new java.util.ArrayList<>();
             for (java.util.Map.Entry<org.bukkit.enchantments.Enchantment, Integer> e
                     : it.getData(io.papermc.paper.datacomponent.DataComponentTypes.ENCHANTMENTS)
@@ -1006,21 +1012,23 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 sb.append("\n   附魔: ").append(String.join(", ", es));
             }
         }
-        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.ATTRIBUTE_MODIFIERS)) {
+        // 属性 —— ⚠️ 必须给 **slot** 与**原版 operation 名**，否则 AI 填不回
+        if (isOverridden(it, io.papermc.paper.datacomponent.DataComponentTypes
+                .ATTRIBUTE_MODIFIERS)) {
             java.util.List<String> as = new java.util.ArrayList<>();
             for (io.papermc.paper.datacomponent.item.ItemAttributeModifiers.Entry e
                     : it.getData(io.papermc.paper.datacomponent.DataComponentTypes
                             .ATTRIBUTE_MODIFIERS).modifiers()) {
-                as.add((e.modifier().getAmount() >= 0 ? "+" : "")
-                        + e.modifier().getAmount() + " "
+                as.add(fmtAmount(e.modifier().getAmount()) + " "
                         + e.attribute().getKey().getKey() + " ("
-                        + e.modifier().getOperation().name().toLowerCase() + ")");
+                        + vanillaOperation(e.modifier().getOperation())
+                        + ", slot=" + e.getGroup().toString().toLowerCase() + ")");
             }
             if (!as.isEmpty()) {
                 sb.append("\n   属性: ").append(String.join(", ", as));
             }
         }
-        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.LORE)) {
+        if (isOverridden(it, io.papermc.paper.datacomponent.DataComponentTypes.LORE)) {
             java.util.List<String> ls = new java.util.ArrayList<>();
             for (net.kyori.adventure.text.Component c
                     : it.getData(io.papermc.paper.datacomponent.DataComponentTypes.LORE)
@@ -1031,16 +1039,52 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 sb.append("\n   说明: ").append(String.join(" / ", ls));
             }
         }
-        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.UNBREAKABLE)) {
+        if (isOverridden(it, io.papermc.paper.datacomponent.DataComponentTypes.UNBREAKABLE)) {
             sb.append("\n   不可破坏");
         }
-        if (it.hasData(io.papermc.paper.datacomponent.DataComponentTypes.RARITY)) {
+        if (isOverridden(it, io.papermc.paper.datacomponent.DataComponentTypes.RARITY)) {
             Object r = it.getData(io.papermc.paper.datacomponent.DataComponentTypes.RARITY);
-            if (!"COMMON".equals(String.valueOf(r))) {
-                sb.append("\n   稀有度: ").append(r);
-            }
+            sb.append("\n   稀有度: ").append(r);
         }
         return sb.toString();
+    }
+
+    /** 这个组件是**显式写上去的**吗（与「物品类型自带的默认值」区分）。 */
+    private boolean isOverridden(org.bukkit.inventory.ItemStack it,
+                                 io.papermc.paper.datacomponent.DataComponentType type) {
+        return it.hasData(type) && it.isDataOverridden(type);
+    }
+
+    /**
+     * 属性修饰符的 operation → **原版 SNBT 名**。
+     *
+     * 🔴 真机实测：`Operation.name()` 是 `ADD_NUMBER`，而 26.3 的组件语法要
+     *    **`add_value`** —— 照抄枚举名填回 `components` 会失败。
+     *    （与坑 12「26.3 把标识符改了」同族。）
+     */
+    private String vanillaOperation(org.bukkit.attribute.AttributeModifier.Operation op) {
+        switch (op) {
+            case ADD_NUMBER:
+                return "add_value";
+            case ADD_SCALAR:
+                return "add_multiplied_base";
+            case MULTIPLY_SCALAR_1:
+                return "add_multiplied_total";
+            default:
+                return op.name().toLowerCase();
+        }
+    }
+
+    /** 数字去掉浮点尾巴（`-2.4000000953674316` → `-2.4`）。 */
+    private String fmtAmount(double v) {
+        String s = String.format(java.util.Locale.ROOT, "%.2f", v);
+        while (s.endsWith("0")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        if (s.endsWith(".")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return (v >= 0 ? "+" : "") + s;
     }
 
     private void reportInspect(String id, String text) {
