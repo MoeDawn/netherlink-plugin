@@ -575,6 +575,43 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 getServer().broadcast(head.append(body)));
     }
 
+    /**
+     * 传送并**如实播报**：成功才广播那句话，失败私聊告知。
+     *
+     * 🔴 2026-10-12 修：原先两处都把 `teleportAsync` 的 future **丢掉**，
+     *    不管成没成都广播「X 已传送到 …」—— 那是**静默撒谎**
+     *    （被别的插件取消、目标区块加载不出来、Folia region 不对都会 false）。
+     * ⚠️ 回调不保证在主线程 ⇒ 切回 global region 再发消息。
+     * ⚠️ 失败要把冷却**退回去** —— 没传成不该罚玩家等。
+     */
+    private void teleportAndAnnounce(Player player,
+                                     org.bukkit.Location dest,
+                                     net.kyori.adventure.text.Component successLine,
+                                     java.util.UUID cooldownKey) {
+        player.teleportAsync(dest,
+                        org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.PLUGIN)
+                .thenAccept(ok -> Bukkit.getGlobalRegionScheduler().execute(this, () -> {
+                    if (Boolean.TRUE.equals(ok)) {
+                        getServer().broadcast(successLine);
+                    } else {
+                        // 失败：退冷却 + 如实告知（别让玩家以为传过去了）
+                        menuLastTeleport.remove(cooldownKey);
+                        player.sendMessage(net.kyori.adventure.text.Component.text(
+                                "传送没有成功（目标位置加载不出来，或被其它插件拦下）。",
+                                net.kyori.adventure.text.format.NamedTextColor.RED));
+                    }
+                }))
+                .exceptionally(ex -> {
+                    Bukkit.getGlobalRegionScheduler().execute(this, () -> {
+                        menuLastTeleport.remove(cooldownKey);
+                        player.sendMessage(net.kyori.adventure.text.Component.text(
+                                "传送出错：" + ex.getMessage(),
+                                net.kyori.adventure.text.format.NamedTextColor.RED));
+                    });
+                    return null;
+                });
+    }
+
     /** 冷却检查。返回 true 表示这次点击可以执行。 */
     private boolean menuCooldownOk(Player player) {
         if (menuTeleportCooldownSec <= 0) {
@@ -613,16 +650,16 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                     net.kyori.adventure.text.format.NamedTextColor.RED));
             return;
         }
-        player.teleportAsync(target.getLocation(),
-                org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.PLUGIN);
-        Bukkit.getServer().broadcast(net.kyori.adventure.text.Component.text()
-                .append(net.kyori.adventure.text.Component.text(player.getName(),
-                        net.kyori.adventure.text.format.NamedTextColor.AQUA))
-                .append(net.kyori.adventure.text.Component.text(" 已传送到 ",
-                        net.kyori.adventure.text.format.NamedTextColor.YELLOW))
-                .append(net.kyori.adventure.text.Component.text(target.getName(),
-                        net.kyori.adventure.text.format.NamedTextColor.AQUA))
-                .build());
+        teleportAndAnnounce(player, target.getLocation(),
+                net.kyori.adventure.text.Component.text()
+                        .append(net.kyori.adventure.text.Component.text(player.getName(),
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA))
+                        .append(net.kyori.adventure.text.Component.text(" 已传送到 ",
+                                net.kyori.adventure.text.format.NamedTextColor.YELLOW))
+                        .append(net.kyori.adventure.text.Component.text(target.getName(),
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA))
+                        .build(),
+                player.getUniqueId());
     }
 
     /**
@@ -659,14 +696,14 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         }
         org.bukkit.Location dest = new org.bukkit.Location(resolved,
                 loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
-        player.teleportAsync(dest,
-                org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.PLUGIN);
-        Bukkit.getServer().broadcast(net.kyori.adventure.text.Component.text()
-                .append(net.kyori.adventure.text.Component.text(player.getName(),
-                        net.kyori.adventure.text.format.NamedTextColor.AQUA))
-                .append(net.kyori.adventure.text.Component.text(" 已传送到死亡点",
-                        net.kyori.adventure.text.format.NamedTextColor.YELLOW))
-                .build());
+        teleportAndAnnounce(player, dest,
+                net.kyori.adventure.text.Component.text()
+                        .append(net.kyori.adventure.text.Component.text(player.getName(),
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA))
+                        .append(net.kyori.adventure.text.Component.text(" 已传送到死亡点",
+                                net.kyori.adventure.text.format.NamedTextColor.YELLOW))
+                        .build(),
+                player.getUniqueId());
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -794,8 +831,20 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             if ("items".equals(type) && p.has("items")) {
                 for (com.google.gson.JsonElement ie : p.getAsJsonArray("items")) {
                     JsonObject it = ie.getAsJsonObject();
+                    int n0 = it.has("count") ? it.get("count").getAsInt() : 1;
+                    // ⚠️ 条目可能**没有 `id`** —— 那是**槽位寻址**出来的东西
+                    //    （播报模板的 `done_items_from` 指到了 `pay` 之类的参数）。
+                    //    这时本端**不知道**它是哪件物品，只能当纯文本渲染。
+                    //    不加这一支会 NPE ⇒ 整条播报发不出去（静默）。
+                    if (!it.has("id")) {
+                        String only = it.has("name") ? it.get("name").getAsString() : "?";
+                        out = out.append(net.kyori.adventure.text.Component.text(
+                                "⌜" + only + "⌝ ×" + n0,
+                                net.kyori.adventure.text.format.NamedTextColor.AQUA));
+                        continue;
+                    }
                     String id = it.get("id").getAsString();
-                    int n = it.has("count") ? it.get("count").getAsInt() : 1;
+                    int n = n0;
                     String name = it.has("name") && !it.get("name").getAsString().isEmpty()
                             ? it.get("name").getAsString() : id;
                     String comps = it.has("components") && !it.get("components").isJsonNull()
