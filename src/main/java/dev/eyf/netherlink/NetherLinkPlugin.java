@@ -948,8 +948,36 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             java.util.Map<String, org.bukkit.inventory.ItemStack> slotCache) {
         String comps = it.has("components") && !it.get("components").isJsonNull()
                 ? it.get("components").getAsString() : "";
+        // 🔴 项自带 `slot`（`modify_item` 的两行都用它）：
+        //    · 没有 `components` ⇒ 直接是玩家那个格子上**真实的那件**
+        //      （「当前」那行）
+        //    · 有 `components`   ⇒ 以真实那件为**基底**合并出改完的样子
+        //      （「改成」那行）—— 走 `buildMergedItem`，与真正执行**同口径**，
+        //      所以卡片上看到的就是点确认之后到手的东西。
+        if (it.has("slot")) {
+            String slot = it.get("slot").getAsString();
+            org.bukkit.inventory.ItemStack real = slotCache.get(slot);
+            if (real == null) {
+                real = readSlot(player, slot);
+                slotCache.put(slot, real);
+            }
+            if (real != null && !real.getType().isAir()) {
+                org.bukkit.inventory.ItemStack shown =
+                        comps.isEmpty() ? real : buildMergedItem(real, comps);
+                if (shown != null) {
+                    shown.setAmount(Math.max(1, Math.min(shown.getAmount(), 99)));
+                    return shown;
+                }
+                getLogger().warning("NetherLink: 卡片的合并预览造不出来，"
+                        + "退回原物品 | slot=" + slot + " components=" + comps);
+                real.setAmount(Math.max(1, Math.min(real.getAmount(), 99)));
+                return real;
+            }
+            // 槽位空着 —— 由预校验去报错，卡片给个占位免得整条消息发不出去
+            return new org.bukkit.inventory.ItemStack(org.bukkit.Material.BARRIER);
+        }
         if (comps.isEmpty() && line.has("slots")) {
-            // 从玩家身上读真实物品（`modify_item` 的 targets）
+            // 老形态（整行带 slots、项里没有）—— 留着兼容
             for (com.google.gson.JsonElement se : line.getAsJsonArray("slots")) {
                 String slot = se.getAsString();
                 org.bukkit.inventory.ItemStack real = slotCache.get(slot);
@@ -1028,7 +1056,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                             new java.util.HashMap<>();
                     for (com.google.gson.JsonElement ie : line.getAsJsonArray("items")) {
                         JsonObject it = ie.getAsJsonObject();
-                        String id = it.get("id").getAsString();
+                        // ⚠️ `id` 可能**没有** —— `modify_item` 的两行只给 `slot`
+                        //    （物品由本端按槽位去读），这时拿 `name` 当显示兜底。
+                        String id = it.has("id") ? it.get("id").getAsString() : "";
                         int n = it.has("count") ? it.get("count").getAsInt() : 1;
                         String disp = it.has("name") && !it.get("name").getAsString().isEmpty()
                                 ? it.get("name").getAsString() : id;
@@ -1038,6 +1068,9 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         org.bukkit.inventory.ItemStack show =
                                 cardItemStack(player, line, it, id, n, slotCache);
                         chunk = chunk.hoverEvent(show.asHoverEvent());
+                        if (!it.has("count")) {
+                            n = Math.max(1, Math.min(show.getAmount(), 99));
+                        }
                         row = row.append(chunk).append(
                                 net.kyori.adventure.text.Component.text(" ×" + n + "  "));
                     }
@@ -1136,12 +1169,24 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                 String op = st.get("op").getAsString();
                 String problem = null;
                 if ("check".equals(op)) {
-                    String id = st.get("item").getAsString();
-                    int need = st.get("count").getAsInt();
-                    int have = countItem(player, id, stepComponents(st));
-                    if (have < need) {
-                        problem = "材料不足：⌜" + stepLabel(st, id) + "⌝ 需要 "
-                                + need + "，你有 " + have;
+                    // 槽位寻址的 check：只看那一格
+                    if (st.has("slot")) {
+                        String slot = st.get("slot").getAsString();
+                        int need = st.get("count").getAsInt();
+                        int have = countSlot(player, slot);
+                        if (have < need) {
+                            problem = (have == 0
+                                    ? "那一格是空的：" + slot + "（" + stepLabel(st, slot) + "）"
+                                    : "槽位 " + slot + " 上只有 " + have + " 个，不够 " + need);
+                        }
+                    } else {
+                        String id = st.get("item").getAsString();
+                        int need = st.get("count").getAsInt();
+                        int have = countItem(player, id);
+                        if (have < need) {
+                            problem = "材料不足：⌜" + stepLabel(st, id) + "⌝ 需要 "
+                                    + need + "，你有 " + have;
+                        }
                     }
                 } else if ("give".equals(op)) {
                     // 干跑：造不出来 = 组件写法有问题，现在就该拒绝
@@ -1160,6 +1205,30 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                             problem, net.kyori.adventure.text.format.NamedTextColor.RED));
                     reportActionResult(token, player.getName(), false, problem);
                     return;   // ⚠️ 一个都不动
+                }
+            }
+            // ①b **歧义检查**：按类型扣时，背包里同一种物品**散落在多格**，
+            //     分不清要扣哪一件。宁可现在拒绝，也不要猜着扣 ——
+            //     猜错就是**销毁玩家的东西**。
+            //     ⚠️ 报错要**列出具体是哪几格**（用户 2026-10-12）：那样 AI
+            //        才能问得具体（「第 1 格还是第 13 格？」），而不是让玩家
+            //        去改参数。用了槽位寻址的条目不受影响（本来就指明了一格）。
+            for (com.google.gson.JsonElement se : steps) {
+                JsonObject st = se.getAsJsonObject();
+                if (!"clear".equals(st.get("op").getAsString()) || st.has("slot")) {
+                    continue;
+                }
+                String id = st.get("item").getAsString();
+                java.util.List<String> where = slotsHolding(player, id);
+                if (where.size() >= 2) {
+                    String problem = "⌜" + stepLabel(st, id) + "⌝ 在你背包里有 "
+                            + where.size() + " 件，分散在 " + String.join("、", where)
+                            + " —— 要交哪一件？请说清（或用槽位写法，如 "
+                            + where.get(0) + "=名字）。本次没有扣任何东西。";
+                    player.sendMessage(net.kyori.adventure.text.Component.text(
+                            problem, net.kyori.adventure.text.format.NamedTextColor.RED));
+                    reportActionResult(token, player.getName(), false, problem);
+                    return;
                 }
             }
             // ② 全通过才开始动手
@@ -1242,14 +1311,26 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
         if ("modify".equals(op)) {
             return applyModify(player, st);
         }
+        // ---- 槽位寻址的 clear：`{op:clear, slot:"weapon.mainhand", count:1} ----
+        // 由 MC 端**读那一格真实的物品**再扣（LLM 读不到玩家物品的组件，
+        // 见 takeSlot 的说明）。check 在预校验里就处理掉了，走不到这儿。
+        if (st.has("slot")) {
+            String slot = st.get("slot").getAsString();
+            int n = st.get("count").getAsInt();
+            if ("clear".equals(op)) {
+                return takeSlot(player, slot, n);
+            }
+            return "槽位寻址只支持 check / clear，实际：" + op;
+        }
         String id = st.get("item").getAsString();
         int n = st.get("count").getAsInt();
         String comps = stepComponents(st);
         if ("clear".equals(op)) {
-            // 🔴 2026-10-11 审计发现：这里原先是 `takeItems(player, id, n)`
-            //    —— **丢掉了 `comps`**。于是 `swap_items` 的 `pay` 即便写了
-            //    组件也按类型清，可能收走玩家背包里另一把同 id 的物品。
-            return takeItems(player, id, n, comps);
+            // 🔴 **按类型扣**（2026-10-12 推演改回来）：
+            //    LLM **读不到**玩家物品的组件，`pay` 里写的组件是**猜**的
+            //    ⇒ 精确匹配必然失败、「升级我这把剑」必挂。
+            //    歧义不靠精确匹配防，靠预校验**拒绝**（见 runSteps）。
+            return takeItems(player, id, n);
         }
         if ("give".equals(op)) {
             return giveItems(player, id, n, comps);
@@ -1326,32 +1407,30 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
 
     /** 扣物品（**原子**：不够就一个都不扣）。 */
     /**
-     * 从背包扣掉 `n` 个。
+     * 从背包扣掉 `n` 个**按类型**（不看组件）。
      *
-     * 🔴 **给了组件就按组件精确匹配**（2026-10-11 审计补）。原先只按
-     * `getType()` 匹配，于是「升级我这把附魔剑」可能收走背包里另一把
-     * 同 id 的普通剑。`components` 为空时保持**只比类型**的老行为
-     * （`swap_items` 交普通材料时不能因为玩家改过名就扣不到）。
+     * 🔴 2026-10-12 改回只比类型：LLM **读不到**玩家物品的组件，它在
+     *    `pay` 里写的组件是**猜**的 ⇒ 按组件精确匹配必然失败，
+     *    「升级我手上这把剑」这类请求**必挂**（推演实测确认）。
+     *    歧义改由 `runSteps` 的预校验**拒绝**（该类型有 ≥2 种组件形态就报错）。
      *
      * ⚠️ 判据必须与 `countItem` **完全一致** —— 两处不一致会出现
      *    「check 说有、clear 说没有」，或者 check 放过而 clear 多拿。
      */
-    private String takeItems(Player player, String id, int n, String components) {
-        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, components);
+    private String takeItems(Player player, String id, int n) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
         if (proto == null) {
-            return "物品写法有问题，服务器造不出来：" + id
-                    + (components.isEmpty() ? "" : "[" + components + "]");
+            return "物品 ID 有问题：" + id;
         }
-        int have = countItem(player, id, components);
+        int have = countItem(player, id);
         if (have < n) {
             return "材料不足：⌜" + id + "⌝ 需要 " + n + "，你有 " + have;
         }
-        boolean exact = components != null && !components.isEmpty();
         int left = n;
         org.bukkit.inventory.ItemStack[] contents = player.getInventory().getContents();
         for (int i = 0; i < contents.length && left > 0; i++) {
             org.bukkit.inventory.ItemStack it = contents[i];
-            if (it == null || !matchesKind(it, proto, exact)) {
+            if (it == null || it.getType() != proto.getType()) {
                 continue;
             }
             int take = Math.min(left, it.getAmount());
@@ -1362,22 +1441,6 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             }
         }
         return null;
-    }
-
-    /**
-     * 背包里那件 `have` 算不算「和 `proto` 同一种」。
-     *
-     * `exact=false`（调用方没给组件）⇒ **只比类型**，老行为。
-     * `exact=true`          ⇒ 走 `isSimilar`，**忽略数量、尊重组件**。
-     *   （真服实测：裸1 vs 裸3 = true；名字A vs 名字B = false）
-     */
-    private boolean matchesKind(org.bukkit.inventory.ItemStack have,
-                                org.bukkit.inventory.ItemStack proto,
-                                boolean exact) {
-        if (have.getType() != proto.getType()) {
-            return false;
-        }
-        return !exact || have.isSimilar(proto);
     }
 
     /**
@@ -1495,23 +1558,95 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * ⚠️ 只用 id 匹配、不看组件 —— 与 `clear <玩家> <物品> 0` 的口径一致。
      */
     /**
-     * 数背包里有几个。
+     * 数背包里**这一种类型**有几个（不看组件）。
      *
-     * 🔴 判据必须与 `takeItems` **完全一致**（见那里的说明）。
+     * ⚠️ 与 `takeItems` 同一判据。组件不参与匹配的理由见 `takeItems`。
      */
-    private int countItem(Player player, String id, String components) {
-        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, components);
+    private int countItem(Player player, String id) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
         if (proto == null) {
             return 0;
         }
-        boolean exact = components != null && !components.isEmpty();
         int total = 0;
         for (org.bukkit.inventory.ItemStack it : player.getInventory().getContents()) {
-            if (it != null && matchesKind(it, proto, exact)) {
+            if (it != null && it.getType() == proto.getType()) {
                 total += it.getAmount();
             }
         }
         return total;
+    }
+
+    /** 数某个槽位上有几个（空格 / 槽位名不认识都算 0）。 */
+    private int countSlot(Player player, String slot) {
+        org.bukkit.inventory.ItemStack it = readSlot(player, slot);
+        if (it == null || it.getType().isAir()) {
+            return 0;
+        }
+        return it.getAmount();
+    }
+
+    /**
+     * 从**指定槽位**扣掉 `n` 个。
+     *
+     * 🔴 **为什么需要它**（2026-10-12 用户要求）：LLM 读不到玩家物品的组件，
+     *    所以「升级我手上这把剑」它只能**猜**物品与组件 —— 猜不准就扣不到。
+     *    改用槽位寻址后，由**服务器**去读那一格真实的物品，不用猜；
+     *    同一件物品在背包里有多把时也能说清是哪一把。
+     */
+    private String takeSlot(Player player, String slot, int n) {
+        org.bukkit.inventory.ItemStack it = readSlot(player, slot);
+        if (it == null || it.getType().isAir()) {
+            return "那个槽位是空的：" + slot;
+        }
+        if (it.getAmount() < n) {
+            return "槽位 " + slot + " 上只有 " + it.getAmount() + " 个，不够 " + n + " 个";
+        }
+        it.setAmount(it.getAmount() - n);
+        org.bukkit.inventory.EquipmentSlot es = toEquipSlot(slot);
+        if (es != null) {
+            player.getEquipment().setItem(es, it.getAmount() <= 0 ? null : it);
+        } else {
+            Integer idx = toInventoryIndex(slot);
+            if (idx != null) {
+                player.getInventory().setItem(idx, it.getAmount() <= 0 ? null : it);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 背包里这一种类型**散落在哪些槽位**（用于把「扣哪件」讲清楚）。
+     *
+     * 用户 2026-10-12：不要报「你有 2 种不同的剑」让 AI 去猜参数 ——
+     * 要报**具体是哪几格**，那样问玩家才问得具体。
+     */
+    private java.util.List<String> slotsHolding(Player player, String id) {
+        org.bukkit.inventory.ItemStack proto = buildItem(id, 1, "");
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (proto == null) {
+            return out;
+        }
+        for (int i = 0; i < 36; i++) {
+            org.bukkit.inventory.ItemStack it = player.getInventory().getItem(i);
+            if (it != null && it.getType() == proto.getType()) {
+                out.add(i <= 8 ? "hotbar." + i : "inventory." + i);
+            }
+        }
+        for (org.bukkit.inventory.EquipmentSlot es : new org.bukkit.inventory.EquipmentSlot[]{
+                org.bukkit.inventory.EquipmentSlot.HAND,
+                org.bukkit.inventory.EquipmentSlot.OFF_HAND,
+                org.bukkit.inventory.EquipmentSlot.HEAD,
+                org.bukkit.inventory.EquipmentSlot.CHEST,
+                org.bukkit.inventory.EquipmentSlot.LEGS,
+                org.bukkit.inventory.EquipmentSlot.FEET}) {
+            org.bukkit.inventory.ItemStack it = player.getEquipment().getItem(es);
+            if (it != null && it.getType() == proto.getType()) {
+                out.add(es == org.bukkit.inventory.EquipmentSlot.HAND ? "weapon.mainhand"
+                        : es == org.bukkit.inventory.EquipmentSlot.OFF_HAND ? "weapon.offhand"
+                        : "armor." + es.name().toLowerCase());
+            }
+        }
+        return out;
     }
 
     /** 回报 AstrBot：执行结果（它据此决定扣不扣好感）。 */
