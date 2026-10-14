@@ -910,7 +910,7 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             reportInspect(id, "玩家 " + playerName + " 不在线，查不到。");
             return;
         }
-        java.util.List<String> slots = new java.util.ArrayList<>(allSlots());
+        java.util.List<String> slots = new java.util.ArrayList<>(listingSlots(p));
         if (!wantSlot.isEmpty()) {
             if (!allSlots().contains(wantSlot)) {
                 reportInspect(id, "槽位 " + wantSlot + " 不认识。可用："
@@ -976,6 +976,29 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
             ALL_SLOTS_CACHE = java.util.Collections.unmodifiableList(out);
         }
         return ALL_SLOTS_CACHE;
+    }
+
+    /**
+     * **枚举**用：手持那一格只以 `weapon.mainhand` 出现。
+     *
+     * 🔴 2026-10-14 修：原先枚举直接用 `allSlots()`，而 `weapon.mainhand` 与
+     *    `hotbar.<手持格>` 在 Bukkit 里**是同一格**
+     *    （`getEquipment().getItem(HAND)` ≡ `getInventory().getItem(getHeldItemSlot())`）
+     *    ⇒ 玩家手上那件被**列两次**，AI 以为有两把。实测：玩家只有一把钻石剑，
+     *    `inspect_items` 返回了 `weapon.mainhand` 与 `hotbar.1` 两条。
+     *
+     *    ⇒ 枚举时跳过手持格的**原始**名字。`allSlots()` 仍保留两个名字供**校验**用 ——
+     *    AI 明确写 `hotbar.N` 也照样读得到那一格，只是不再主动列它第二次。
+     */
+    private java.util.List<String> listingSlots(Player player) {
+        int held = player.getInventory().getHeldItemSlot();   // 0..8
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String slot : allSlots()) {
+            if (!slot.equals("hotbar." + held)) {
+                out.add(slot);
+            }
+        }
+        return out;
     }
 
     /** 名字或物品 ID 里含 `match`（不区分大小写）就算命中。 */
