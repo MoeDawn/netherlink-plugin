@@ -70,7 +70,8 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
     private String menuItemTeleportDeath = "\u4f20\u9001\u6b7b\u4ea1\u70b9";
     private String menuItemShowItem = "\u5c55\u793a\u624b\u4e0a\u7684\u7269\u54c1";
 
-    // 传送冷却（秒），防连点。0 = 无冷却。
+    // 菜单动作冷却（秒）：传送与展示共用，防连点（展示是全服广播，连点会刷屏）。
+    // 0 = 无冷却。
     private long menuTeleportCooldownSec = 3L;
 
     // 玩家 UUID -> 上次传送的毫秒时间戳。只在主线程访问（点击回调里切了
@@ -301,7 +302,8 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
                         menu-item-teleport-death: "\u4f20\u9001\u6b7b\u4ea1\u70b9"
                         # 第三项:把手上的物品展示给全服(带悬停详情)
                         menu-item-show-item: "\u5c55\u793a\u624b\u4e0a\u7684\u7269\u54c1"
-                        # 传送冷却（秒），防连点。0 = 无冷却
+                        # 菜单动作冷却（秒）：传送与「展示手上物品」共用。
+                        # 展示是全服广播，连点会刷屏。0 = 无冷却
                         menu-teleport-cooldown: 3
                         # 确认卡轮询间隔（毫秒）。0 = 关闭（关掉则确认卡点了没反应）
                         # ⚠️ 只服务来自 AstrBot 的确认卡；本地菜单用点击回调
@@ -537,8 +539,16 @@ public final class NetherLinkPlugin extends JavaPlugin implements Listener {
      * （`ItemStack.asHoverEvent()` 带完整组件）。
      *
      * ⚠️ **不走 report()**：与传送那两项一样完全不依赖 AstrBot（离线可用、不消耗好感）。
+     * 走与传送相同的冷却闸门（menu-teleport-cooldown 同一个值），防连点刷屏。
      */
     private void showHeldItem(Player player) {
+        // 冷却闸门与传送共用：广播型动作必须有，否则连点=全服刷屏
+        if (!menuCooldownOk(player)) {
+            player.sendMessage(net.kyori.adventure.text.Component.text(
+                    "展示太频繁，请稍候。",
+                    net.kyori.adventure.text.format.NamedTextColor.RED));
+            return;
+        }
         org.bukkit.inventory.ItemStack held = player.getInventory().getItemInMainHand();
         if (held == null || held.getType().isAir()) {
             player.sendMessage(net.kyori.adventure.text.Component.text(
